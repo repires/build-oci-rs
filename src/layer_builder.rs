@@ -18,9 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,22 +67,10 @@ pub fn get_all_xattr(path: &Path, skip_xattrs: bool) -> Vec<(String, String)> {
 }
 
 pub fn file_sha256(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-pub fn file_sha256_from_reader<R: Read>(reader: &mut R) -> Result<String> {
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
+    let mut buf = [0u8; 256 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -95,8 +83,6 @@ pub fn file_sha256_from_reader<R: Read>(reader: &mut R) -> Result<String> {
 
 #[derive(Debug, Clone)]
 pub struct LowerEntry {
-    pub tar_index: usize,
-    pub name: String,
     pub entry_type: u8,
     pub uid: u64,
     pub gid: u64,
@@ -123,8 +109,8 @@ struct ArchiveEntries {
 }
 
 /// Parse a single tar archive into entries (can run in parallel)
-fn parse_archive<R: Read>(archive: &mut tar::Archive<R>, idx: usize) -> Result<ArchiveEntries> {
-    let mut entries = Vec::new();
+fn parse_archive<R: Read>(archive: &mut tar::Archive<R>) -> Result<ArchiveEntries> {
+    let mut entries = Vec::with_capacity(1024);
     let mut opaque_whiteouts = Vec::new();
     let mut file_whiteouts = Vec::new();
 
@@ -168,8 +154,6 @@ fn parse_archive<R: Read>(archive: &mut tar::Archive<R>, idx: usize) -> Result<A
             }
 
             let le = LowerEntry {
-                tar_index: idx,
-                name: path_str.clone(),
                 entry_type,
                 uid,
                 gid,
@@ -194,8 +178,7 @@ pub fn analyze_lowers<R: Read + Send>(lowers: &mut [tar::Archive<R>]) -> Result<
     // Parse all archives in parallel
     let parsed: Result<Vec<ArchiveEntries>> = lowers
         .par_iter_mut()
-        .enumerate()
-        .map(|(idx, archive)| parse_archive(archive, idx))
+        .map(|archive| parse_archive(archive))
         .collect();
     let parsed = parsed?;
 
@@ -420,6 +403,10 @@ pub fn create_layer<W: std::io::Write>(
             stack.push(root.join(d));
         }
 
+        // Build HashSets for O(1) lookup during whiteout checking
+        let files_set: HashSet<&str> = files.iter().map(|s| s.as_str()).collect();
+        let dirs_set: HashSet<&str> = dirs.iter().map(|s| s.as_str()).collect();
+
         // Handle whiteout for deleted files
         let rel_for_lookup = if root_rel == "." {
             ".".to_string()
@@ -429,7 +416,7 @@ pub fn create_layer<W: std::io::Write>(
 
         if let Some(old_files) = lower_analysis.dir_contents.get(&rel_for_lookup) {
             for old_file in old_files {
-                if !files.contains(old_file) && !dirs.contains(old_file) {
+                if !files_set.contains(old_file.as_str()) && !dirs_set.contains(old_file.as_str()) {
                     let full_path = if root_rel == "." {
                         format!("./{}", old_file)
                     } else {

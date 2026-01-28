@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 use std::fs;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -69,8 +69,6 @@ impl<W: Write> Write for HashingWriter<W> {
 use crate::blob::Blob;
 use crate::layer_builder::{analyze_lowers, create_layer};
 use crate::{Compression, GlobalConfig};
-
-const IO_BUF_SIZE: usize = 128 * 1024;
 
 fn get_source_date_epoch() -> Option<u64> {
     std::env::var("SOURCE_DATE_EPOCH")
@@ -302,29 +300,30 @@ pub fn build_layer(
             return Ok((new_layer_descs, new_diff_ids));
         }
         Compression::Disabled => {
-            // No compression: tar -> hash -> temp file -> blob
-            let mut tmp_file = tempfile::tempfile_in(tmp_dir)
-                .or_else(|_| tempfile::tempfile())?;
+            // No compression: tar -> dual hash (diff_id + blob_id) -> file
+            // Since uncompressed, diff_id == blob_id, compute once
+            let tar_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
 
             let tar_hexdigest = {
-                let hashing_writer = HashingWriter::new(&mut tmp_file);
+                // Hash while writing - this IS the blob digest too (no compression)
+                let hashing_writer = HashingWriter::new(BufWriter::new(tar_tmp.reopen()?));
                 let mut tar_builder = tar::Builder::new(hashing_writer);
                 tar_builder.follow_symlinks(false);
 
                 create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
-                tar_builder.into_inner()?.finish().1
+                let (mut buf_writer, digest) = tar_builder.into_inner()?.finish();
+                buf_writer.flush()?;
+                digest
             };
 
-            tmp_file.seek(SeekFrom::Start(0))?;
+            let size = tar_tmp.as_file().metadata()?.len();
 
             let mut blob = Blob::new(
                 global_conf,
                 Some("application/vnd.oci.image.layer.v1.tar"),
             );
-            blob.create(|out| {
-                io::copy(&mut tmp_file, out)?;
-                Ok(())
-            })?;
+            // Use pre-computed digest - avoids re-reading the file
+            blob.create_from_temp_with_digest(tar_tmp, size, &tar_hexdigest)?;
             new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
 
             let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];

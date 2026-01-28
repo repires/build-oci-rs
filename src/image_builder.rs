@@ -198,6 +198,8 @@ pub fn build_layer(
         {
             let level = global_conf.compression_level.unwrap_or(5) as u32;
             let mut parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
+                .num_threads(global_conf.workers)
+                .map_err(|e| anyhow::anyhow!("gzp thread config: {}", e))?
                 .compression_level(gzp::Compression::new(level))
                 .from_writer(BufWriter::new(compressed_tmp.reopen()?));
             let mut buf = [0u8; IO_BUF_SIZE];

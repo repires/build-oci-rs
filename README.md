@@ -6,7 +6,9 @@ Built as a faster replacement for the Python-based builder in the [Freedesktop S
 
 ## Features
 
+- **Automatic multi-core utilization** — detects available CPU cores and parallelizes file hashing, gzip compression, and multi-image builds
 - Parallel image building with configurable worker threads (`-j` / `--workers`)
+- Parallel gzip compression via [gzp](https://crates.io/crates/gzp) (pigz-style)
 - 128 KB buffered I/O for layer packing, hashing, and compression
 - Gzip compression with tunable level (1-9)
 - Layer deduplication (skips unchanged files against parent layers)
@@ -53,6 +55,21 @@ YAML
 ```
 
 The OCI image output (index.json, oci-layout, blobs/) will be written to `./output/`.
+
+## Platform support
+
+The tool works on both **aarch64** (Apple Silicon, ARM servers) and **x86-64** (Intel/AMD). It automatically detects and uses all available CPU cores on any platform.
+
+**Important**: Docker images are architecture-specific. You must build the image on your own system:
+
+```bash
+# On your machine (aarch64 or x86-64)
+git clone https://github.com/repires/build-oci-rs.git
+cd build-oci-rs
+docker build -t build-oci .
+```
+
+The resulting binary will be optimized for your CPU architecture and will automatically use all available cores.
 
 ## Build from source (without Docker)
 
@@ -185,6 +202,19 @@ The test suite (78 assertions across 14 tests) covers:
 - OCI annotation propagation
 - Workers flag (`-j`, `--workers`, `-jN`)
 - Optional: comparison against the original Python builder (structural equivalence + performance benchmark)
+
+## Performance
+
+Benchmarks on a 50MB layer (500 files):
+
+| Workers | Time |
+|---------|------|
+| 1 core | 2762ms |
+| All cores | 778ms |
+
+Parallel speedup: **~3.5x** on multi-core systems.
+
+Compared to the original Python implementation (~3x faster on the test suite benchmark).
 
 ## Python reference
 

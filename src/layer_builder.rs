@@ -20,14 +20,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use jwalk::WalkDir;
 use memmap2::Mmap;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use tar;
 
@@ -98,79 +100,125 @@ pub struct LowerEntry {
 
 pub struct LowerAnalysis {
     pub files: BTreeMap<String, LowerEntry>,
-    pub dir_contents: HashMap<String, Vec<String>>,
+    pub dir_contents: FxHashMap<String, Vec<String>>,
 }
 
-pub fn analyze_lowers<R: Read>(lowers: &mut [tar::Archive<R>]) -> Result<LowerAnalysis> {
-    let mut lower_files: BTreeMap<String, LowerEntry> = BTreeMap::new();
+/// Represents parsed entries from a single tar archive before merging
+struct ArchiveEntries {
+    /// Regular entries (non-whiteout)
+    entries: Vec<(String, LowerEntry)>,
+    /// Opaque whiteouts - directories whose contents should be deleted
+    opaque_whiteouts: Vec<String>,
+    /// File whiteouts - specific files to delete
+    file_whiteouts: Vec<String>,
+}
 
-    for (idx, lower) in lowers.iter_mut().enumerate() {
-        for entry_result in lower.entries()? {
-            let mut entry = entry_result?;
+/// Parse a single tar archive into entries (can run in parallel)
+fn parse_archive<R: Read>(archive: &mut tar::Archive<R>, idx: usize) -> Result<ArchiveEntries> {
+    let mut entries = Vec::new();
+    let mut opaque_whiteouts = Vec::new();
+    let mut file_whiteouts = Vec::new();
 
-            // Extract header data before any mutable borrows
-            let entry_type = entry.header().entry_type().as_byte();
-            let uid = entry.header().uid()?;
-            let gid = entry.header().gid()?;
-            let mode = entry.header().mode()?;
-            let mtime = entry.header().mtime()?;
-            let size = entry.header().size()?;
-            let linkname = entry
-                .header()
-                .link_name()?
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let path_str = entry.path()?.to_string_lossy().to_string();
-            let (dirname, basename) = split_path(&path_str);
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
 
-            if basename == ".wh..wh..opq" {
-                let prefix = format!("{}/", dirname);
-                let to_delete: Vec<String> = lower_files
-                    .keys()
-                    .filter(|k| k.starts_with(&prefix))
-                    .cloned()
-                    .collect();
-                for k in to_delete {
-                    lower_files.remove(&k);
-                }
-            } else if basename.starts_with(".wh.") {
-                let real_name = &basename[4..];
-                let full_path = if dirname.is_empty() {
-                    real_name.to_string()
-                } else {
-                    format!("{}/{}", dirname, real_name)
-                };
-                lower_files.remove(&full_path);
+        let entry_type = entry.header().entry_type().as_byte();
+        let uid = entry.header().uid()?;
+        let gid = entry.header().gid()?;
+        let mode = entry.header().mode()?;
+        let mtime = entry.header().mtime()?;
+        let size = entry.header().size()?;
+        let linkname = entry
+            .header()
+            .link_name()?
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let path_str = entry.path()?.to_string_lossy().to_string();
+        let (dirname, basename) = split_path(&path_str);
+
+        if basename == ".wh..wh..opq" {
+            opaque_whiteouts.push(dirname);
+        } else if basename.starts_with(".wh.") {
+            let real_name = &basename[4..];
+            let full_path = if dirname.is_empty() {
+                real_name.to_string()
             } else {
-                let mut pax_headers = HashMap::new();
-                if let Some(pax) = entry.pax_extensions()? {
-                    for ext in pax {
-                        if let Ok(ext) = ext {
-                            let key = ext.key().unwrap_or_default().to_string();
-                            let val = ext.value().unwrap_or_default().to_string();
-                            pax_headers.insert(key, val);
-                        }
+                format!("{}/{}", dirname, real_name)
+            };
+            file_whiteouts.push(full_path);
+        } else {
+            let mut pax_headers = HashMap::new();
+            if let Some(pax) = entry.pax_extensions()? {
+                for ext in pax {
+                    if let Ok(ext) = ext {
+                        let key = ext.key().unwrap_or_default().to_string();
+                        let val = ext.value().unwrap_or_default().to_string();
+                        pax_headers.insert(key, val);
                     }
                 }
-
-                let le = LowerEntry {
-                    tar_index: idx,
-                    name: path_str.clone(),
-                    entry_type,
-                    uid,
-                    gid,
-                    mode,
-                    mtime,
-                    size,
-                    linkname,
-                    pax_headers,
-                };
-                lower_files.insert(path_str, le);
             }
+
+            let le = LowerEntry {
+                tar_index: idx,
+                name: path_str.clone(),
+                entry_type,
+                uid,
+                gid,
+                mode,
+                mtime,
+                size,
+                linkname,
+                pax_headers,
+            };
+            entries.push((path_str, le));
         }
     }
 
-    let mut dir_contents: HashMap<String, Vec<String>> = HashMap::new();
+    Ok(ArchiveEntries {
+        entries,
+        opaque_whiteouts,
+        file_whiteouts,
+    })
+}
+
+pub fn analyze_lowers<R: Read + Send>(lowers: &mut [tar::Archive<R>]) -> Result<LowerAnalysis> {
+    // Parse all archives in parallel
+    let parsed: Result<Vec<ArchiveEntries>> = lowers
+        .par_iter_mut()
+        .enumerate()
+        .map(|(idx, archive)| parse_archive(archive, idx))
+        .collect();
+    let parsed = parsed?;
+
+    // Merge results sequentially to maintain overlay semantics
+    let mut lower_files: BTreeMap<String, LowerEntry> = BTreeMap::new();
+
+    for archive_entries in parsed {
+        // Apply opaque whiteouts from this layer
+        for dirname in &archive_entries.opaque_whiteouts {
+            let prefix = format!("{}/", dirname);
+            let to_delete: Vec<String> = lower_files
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for k in to_delete {
+                lower_files.remove(&k);
+            }
+        }
+
+        // Apply file whiteouts from this layer
+        for path in &archive_entries.file_whiteouts {
+            lower_files.remove(path);
+        }
+
+        // Add/override entries from this layer
+        for (path, entry) in archive_entries.entries {
+            lower_files.insert(path, entry);
+        }
+    }
+
+    let mut dir_contents: FxHashMap<String, Vec<String>> = FxHashMap::default();
     for file in lower_files.keys() {
         let (dirname, basename) = split_path(file);
         dir_contents
@@ -230,32 +278,21 @@ struct FileHashData {
     contents: Option<FileContents>,
 }
 
-/// Recursively collect all regular file paths under a directory.
+/// Recursively collect all regular file paths under a directory using parallel traversal.
 fn collect_regular_files(dir: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    collect_regular_files_recursive(dir, &mut result);
-    result
-}
-
-fn collect_regular_files_recursive(dir: &Path, result: &mut Vec<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                let path = entry.path();
-                if ft.is_dir() {
-                    collect_regular_files_recursive(&path, result);
-                } else if ft.is_file() {
-                    result.push(path);
-                }
-            }
-        }
-    }
+    WalkDir::new(dir)
+        .skip_hidden(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.path())
+        .collect()
 }
 
 /// Hash and prefetch all regular files in parallel using rayon.
 /// Small files are read into memory, large files are memory-mapped.
 /// Returns a map of path -> (sha256_checksum, xattrs, cached_contents).
-fn prehash_and_prefetch_files(upper: &Path) -> HashMap<PathBuf, FileHashData> {
+fn prehash_and_prefetch_files(upper: &Path) -> FxHashMap<PathBuf, FileHashData> {
     let files = collect_regular_files(upper);
     files
         .par_iter()

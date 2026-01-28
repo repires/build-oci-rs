@@ -30,6 +30,8 @@ use gzp::par::compress::ParCompress;
 use gzp::ZWriter;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use zstd::stream::read::Decoder as ZstdDecoder;
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 /// A writer wrapper that computes SHA256 hash while writing.
 /// This eliminates a separate hashing pass over the data.
@@ -115,56 +117,94 @@ pub fn extract_oci_image_info(
     let mut layer_files = Vec::new();
 
     let layers = image_manifest["layers"].as_array().unwrap();
-    for (i, layer) in layers.iter().enumerate() {
-        let layer_digest_str = layer["digest"].as_str().unwrap();
-        let (lalgo, ldigest) = layer_digest_str.split_once(':').unwrap();
-        let origfile = path.join("blobs").join(lalgo).join(ldigest);
 
-        let layer_media_type = layer["mediaType"].as_str().unwrap();
-        let is_gzipped = layer_media_type.ends_with("+gzip");
+    let results: Result<Vec<_>> = layers
+        .par_iter()
+        .enumerate()
+        .map(|(i, layer)| {
+            let layer_digest_str = layer["digest"].as_str().unwrap();
+            let (lalgo, ldigest) = layer_digest_str.split_once(':').unwrap();
+            let origfile = path.join("blobs").join(lalgo).join(ldigest);
 
-        let (_, _diff_id) = diff_ids[i].split_once(':').unwrap();
+            let layer_media_type = layer["mediaType"].as_str().unwrap();
+            let is_gzipped = layer_media_type.ends_with("+gzip");
+            let is_zstd = layer_media_type.ends_with("+zstd");
 
-        let out_media_type = if global_conf.compression == Compression::Gzip {
-            "application/vnd.oci.image.layer.v1.tar+gzip"
-        } else {
-            "application/vnd.oci.image.layer.v1.tar"
-        };
+            // diff_ids are read-only, safe to access
+            let (_, _diff_id) = diff_ids[i].split_once(':').unwrap();
 
-        let mut output_blob = Blob::new(global_conf, Some(out_media_type));
+            let out_media_type = match global_conf.compression {
+                Compression::Gzip => "application/vnd.oci.image.layer.v1.tar+gzip",
+                Compression::Zstd => "application/vnd.oci.image.layer.v1.tar+zstd",
+                Compression::Disabled => "application/vnd.oci.image.layer.v1.tar",
+            };
 
-        output_blob.create(|tmp_file| {
-            let inp = fs::File::open(&origfile)?;
-            let mut reader = BufReader::new(inp);
+            let mut output_blob = Blob::new(global_conf, Some(out_media_type));
 
-            if is_gzipped {
-                if global_conf.compression == Compression::Gzip {
-                    // gzip -> gzip: just copy
-                    io::copy(&mut reader, tmp_file)?;
+            output_blob.create(|tmp_file| {
+                let inp = fs::File::open(&origfile)?;
+                let reader = BufReader::new(inp);
+
+                // First, get an uncompressed reader if needed
+                let mut decompressed: Box<dyn Read> = if is_gzipped {
+                    Box::new(GzDecoder::new(reader))
+                } else if is_zstd {
+                    Box::new(ZstdDecoder::new(reader)?)
                 } else {
-                    // gzip -> uncompressed: decompress
-                    let mut decoder = GzDecoder::new(reader);
-                    io::copy(&mut decoder, tmp_file)?;
-                }
-            } else {
-                if global_conf.compression == Compression::Gzip {
-                    // uncompressed -> gzip: compress
-                    let level = flate2::Compression::new(
-                        global_conf.compression_level.unwrap_or(5) as u32,
-                    );
-                    let mut encoder = GzEncoder::new(std::io::Write::by_ref(tmp_file), level);
-                    io::copy(&mut reader, &mut encoder)?;
-                    encoder.finish()?;
-                } else {
-                    // uncompressed -> uncompressed: just copy
-                    io::copy(&mut reader, tmp_file)?;
-                }
-            }
-            Ok(())
-        })?;
+                    Box::new(reader)
+                };
 
-        layer_descs.push(output_blob.descriptor.as_ref().unwrap().to_json());
-        layer_files.push(output_blob.filename.unwrap());
+                // Now compress to the target format
+                match global_conf.compression {
+                    Compression::Gzip => {
+                        if is_gzipped {
+                            // gzip -> gzip: reopen and copy directly
+                            let inp = fs::File::open(&origfile)?;
+                            let mut reader = BufReader::new(inp);
+                            io::copy(&mut reader, tmp_file)?;
+                        } else {
+                            let level = flate2::Compression::new(
+                                global_conf.compression_level.unwrap_or(5) as u32,
+                            );
+                            let mut encoder =
+                                GzEncoder::new(std::io::Write::by_ref(tmp_file), level);
+                            io::copy(&mut decompressed, &mut encoder)?;
+                            encoder.finish()?;
+                        }
+                    }
+                    Compression::Zstd => {
+                        if is_zstd {
+                            // zstd -> zstd: reopen and copy directly
+                            let inp = fs::File::open(&origfile)?;
+                            let mut reader = BufReader::new(inp);
+                            io::copy(&mut reader, tmp_file)?;
+                        } else {
+                            let level = global_conf.compression_level.unwrap_or(3) as i32;
+                            let mut encoder = ZstdEncoder::new(tmp_file, level)?;
+                            encoder.multithread(global_conf.workers as u32)?;
+                            io::copy(&mut decompressed, &mut encoder)?;
+                            encoder.finish()?;
+                        }
+                    }
+                    Compression::Disabled => {
+                        io::copy(&mut decompressed, tmp_file)?;
+                    }
+                }
+                Ok(())
+            })?;
+
+            Ok((
+                output_blob.descriptor.as_ref().unwrap().to_json(),
+                output_blob.filename.unwrap(),
+            ))
+        })
+        .collect();
+
+    let results = results?;
+
+    for (desc, file) in results {
+        layer_descs.push(desc);
+        layer_files.push(file);
     }
 
     Ok((layer_descs, layer_files, diff_ids, history))
@@ -179,13 +219,13 @@ pub fn build_layer(
     fs::create_dir_all(tmp_dir).ok();
 
     // Open lower tars for deduplication analysis
-    let mut lower_archives: Vec<tar::Archive<Box<dyn Read>>> = Vec::new();
+    let mut lower_archives: Vec<tar::Archive<Box<dyn Read + Send>>> = Vec::new();
     for lower_path in lowers {
         let f = fs::File::open(lower_path)?;
-        let reader: Box<dyn Read> = if global_conf.compression == Compression::Gzip {
-            Box::new(GzDecoder::new(BufReader::new(f)))
-        } else {
-            Box::new(BufReader::new(f))
+        let reader: Box<dyn Read + Send> = match global_conf.compression {
+            Compression::Gzip => Box::new(GzDecoder::new(BufReader::new(f))),
+            Compression::Zstd => Box::new(ZstdDecoder::new(BufReader::new(f))?),
+            Compression::Disabled => Box::new(BufReader::new(f)),
         };
         lower_archives.push(tar::Archive::new(reader));
     }
@@ -193,69 +233,104 @@ pub fn build_layer(
 
     let mut new_layer_descs = Vec::new();
 
-    if global_conf.compression == Compression::Gzip {
-        // STREAMING: tar -> hash -> gzip -> blob (single pass, no temp tar file)
-        let compressed_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
-        let level = global_conf.compression_level.unwrap_or(5) as u32;
+    match global_conf.compression {
+        Compression::Gzip => {
+            // STREAMING: tar -> hash(diff_id) -> gzip -> file
+            // Then hash blob during copy to final location
+            let compressed_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
+            let level = global_conf.compression_level.unwrap_or(5) as u32;
 
-        let tar_hexdigest = {
-            let parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
-                .num_threads(global_conf.workers)
-                .map_err(|e| anyhow::anyhow!("gzp thread config: {}", e))?
-                .compression_level(gzp::Compression::new(level))
-                .from_writer(BufWriter::new(compressed_tmp.reopen()?));
+            let tar_hexdigest = {
+                let parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
+                    .num_threads(global_conf.workers)
+                    .map_err(|e| anyhow::anyhow!("gzp thread config: {}", e))?
+                    .compression_level(gzp::Compression::new(level))
+                    .from_writer(BufWriter::new(compressed_tmp.reopen()?));
 
-            // Stack: tar -> HashingWriter -> gzp -> compressed file
-            let hashing_writer = HashingWriter::new(parz);
-            let mut tar_builder = tar::Builder::new(hashing_writer);
-            tar_builder.follow_symlinks(false);
+                // Stack: tar -> HashingWriter(diff_id) -> gzp -> file
+                let diff_hasher = HashingWriter::new(parz);
+                let mut tar_builder = tar::Builder::new(diff_hasher);
+                tar_builder.follow_symlinks(false);
 
-            create_layer(&mut tar_builder, upper, &lower_analysis)?;
+                create_layer(&mut tar_builder, upper, &lower_analysis)?;
 
-            let (mut parz, digest) = tar_builder.into_inner()?.finish();
-            parz.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
-            digest
-        };
+                let (mut parz, diff_digest) = tar_builder.into_inner()?.finish();
+                parz.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
+                diff_digest
+            };
 
-        let mut blob = Blob::new(
-            global_conf,
-            Some("application/vnd.oci.image.layer.v1.tar+gzip"),
-        );
-        blob.create_from_path(compressed_tmp.path())?;
-        new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
+            let mut blob = Blob::new(
+                global_conf,
+                Some("application/vnd.oci.image.layer.v1.tar+gzip"),
+            );
+            blob.create_from_path(compressed_tmp.path())?;
+            new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
 
-        let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
-        return Ok((new_layer_descs, new_diff_ids));
+            let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
+            return Ok((new_layer_descs, new_diff_ids));
+        }
+        Compression::Zstd => {
+            // STREAMING: tar -> hash(diff_id) -> zstd(multithread) -> file
+            // Then hash blob during copy to final location
+            let compressed_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
+            let level = global_conf.compression_level.unwrap_or(3) as i32;
+
+            let tar_hexdigest = {
+                let mut zstd_encoder = ZstdEncoder::new(BufWriter::new(compressed_tmp.reopen()?), level)?;
+                zstd_encoder.multithread(global_conf.workers as u32)?;
+
+                // Stack: tar -> HashingWriter(diff_id) -> zstd -> file
+                let diff_hasher = HashingWriter::new(zstd_encoder);
+                let mut tar_builder = tar::Builder::new(diff_hasher);
+                tar_builder.follow_symlinks(false);
+
+                create_layer(&mut tar_builder, upper, &lower_analysis)?;
+
+                let (zstd_encoder, diff_digest) = tar_builder.into_inner()?.finish();
+                zstd_encoder.finish()?;
+                diff_digest
+            };
+
+            let mut blob = Blob::new(
+                global_conf,
+                Some("application/vnd.oci.image.layer.v1.tar+zstd"),
+            );
+            blob.create_from_path(compressed_tmp.path())?;
+            new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
+
+            let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
+            return Ok((new_layer_descs, new_diff_ids));
+        }
+        Compression::Disabled => {
+            // No compression: tar -> hash -> temp file -> blob
+            let mut tmp_file = tempfile::tempfile_in(tmp_dir)
+                .or_else(|_| tempfile::tempfile())?;
+
+            let tar_hexdigest = {
+                let hashing_writer = HashingWriter::new(&mut tmp_file);
+                let mut tar_builder = tar::Builder::new(hashing_writer);
+                tar_builder.follow_symlinks(false);
+
+                create_layer(&mut tar_builder, upper, &lower_analysis)?;
+                tar_builder.into_inner()?.finish().1
+            };
+
+            tmp_file.seek(SeekFrom::Start(0))?;
+
+            let mut blob = Blob::new(
+                global_conf,
+                Some("application/vnd.oci.image.layer.v1.tar"),
+            );
+            blob.create(|out| {
+                io::copy(&mut tmp_file, out)?;
+                Ok(())
+            })?;
+            new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
+
+            let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
+            return Ok((new_layer_descs, new_diff_ids));
+        }
     }
-
-    // No compression: tar -> hash -> temp file -> blob
-    let mut tmp_file = tempfile::tempfile_in(tmp_dir)
-        .or_else(|_| tempfile::tempfile())?;
-
-    let tar_hexdigest = {
-        let hashing_writer = HashingWriter::new(&mut tmp_file);
-        let mut tar_builder = tar::Builder::new(hashing_writer);
-        tar_builder.follow_symlinks(false);
-
-        create_layer(&mut tar_builder, upper, &lower_analysis)?;
-        tar_builder.into_inner()?.finish().1
-    };
-
-    tmp_file.seek(SeekFrom::Start(0))?;
-
-    let mut blob = Blob::new(
-        global_conf,
-        Some("application/vnd.oci.image.layer.v1.tar"),
-    );
-    blob.create(|out| {
-        io::copy(&mut tmp_file, out)?;
-        Ok(())
-    })?;
-    new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
-
-    let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
-
-    Ok((new_layer_descs, new_diff_ids))
 }
 
 pub fn build_image(

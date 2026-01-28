@@ -28,7 +28,7 @@ use tempfile::NamedTempFile;
 
 use crate::GlobalConfig;
 
-const IO_BUF_SIZE: usize = 128 * 1024;
+const IO_BUF_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BlobDescriptor {
@@ -167,6 +167,32 @@ impl Blob {
         let dest = blob_dir.join(&hexdigest);
         self.filename = Some(dest.clone());
         dest_tmp.persist(&dest).map_err(|e| anyhow::anyhow!("persist blob: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Create blob from a temp file with a pre-computed digest.
+    /// This avoids re-reading the file to compute the hash (zero-copy move).
+    pub fn create_from_temp_with_digest(
+        &mut self,
+        temp_file: NamedTempFile,
+        size: u64,
+        hexdigest: &str,
+    ) -> Result<()> {
+        let blob_dir = self.output_dir.join("blobs").join("sha256");
+        fs::create_dir_all(&blob_dir)?;
+
+        self.descriptor = Some(BlobDescriptor {
+            media_type: self.media_type.clone(),
+            size,
+            digest: format!("sha256:{}", hexdigest),
+            platform: None,
+            annotations: None,
+        });
+
+        let dest = blob_dir.join(hexdigest);
+        self.filename = Some(dest.clone());
+        temp_file.persist(&dest).map_err(|e| anyhow::anyhow!("persist blob: {}", e))?;
 
         Ok(())
     }

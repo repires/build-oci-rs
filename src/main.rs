@@ -18,6 +18,13 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 mod blob;
 mod image_builder;
 mod layer_builder;
@@ -29,6 +36,7 @@ use anyhow::{bail, Result};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Compression {
     Gzip,
+    Zstd,
     Disabled,
 }
 
@@ -74,12 +82,13 @@ fn main() -> Result<()> {
     let compression_str = data
         .get("compression")
         .and_then(|v| v.as_str())
-        .unwrap_or("gzip");
+        .unwrap_or("zstd");
 
     let compression = match compression_str {
         "gzip" => Compression::Gzip,
+        "zstd" => Compression::Zstd,
         "disabled" => Compression::Disabled,
-        other => bail!("Compression must be gzip or disabled, got: {}", other),
+        other => bail!("Compression must be gzip, zstd, or disabled, got: {}", other),
     };
 
     let compression_level = data
@@ -87,10 +96,10 @@ fn main() -> Result<()> {
         .and_then(|v| v.as_u64())
         .map(|v| v as u32)
         .or_else(|| {
-            if compression == Compression::Gzip {
-                Some(5)
-            } else {
-                None
+            match compression {
+                Compression::Gzip => Some(5),
+                Compression::Zstd => Some(3), // zstd level 3 is a good default (fast, decent ratio)
+                Compression::Disabled => None,
             }
         });
 

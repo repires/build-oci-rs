@@ -175,77 +175,83 @@ pub fn build_layer(
     lowers: &[PathBuf],
     global_conf: &GlobalConfig,
 ) -> Result<(Vec<serde_json::Value>, Vec<String>)> {
-    // Create tar in /var/tmp to avoid RAM pressure
     let tmp_dir = Path::new("/var/tmp");
     fs::create_dir_all(tmp_dir).ok();
 
+    // Open lower tars for deduplication analysis
+    let mut lower_archives: Vec<tar::Archive<Box<dyn Read>>> = Vec::new();
+    for lower_path in lowers {
+        let f = fs::File::open(lower_path)?;
+        let reader: Box<dyn Read> = if global_conf.compression == Compression::Gzip {
+            Box::new(GzDecoder::new(BufReader::new(f)))
+        } else {
+            Box::new(BufReader::new(f))
+        };
+        lower_archives.push(tar::Archive::new(reader));
+    }
+    let lower_analysis = analyze_lowers(&mut lower_archives)?;
+
+    let mut new_layer_descs = Vec::new();
+
+    if global_conf.compression == Compression::Gzip {
+        // STREAMING: tar -> hash -> gzip -> blob (single pass, no temp tar file)
+        let compressed_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
+        let level = global_conf.compression_level.unwrap_or(5) as u32;
+
+        let tar_hexdigest = {
+            let parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
+                .num_threads(global_conf.workers)
+                .map_err(|e| anyhow::anyhow!("gzp thread config: {}", e))?
+                .compression_level(gzp::Compression::new(level))
+                .from_writer(BufWriter::new(compressed_tmp.reopen()?));
+
+            // Stack: tar -> HashingWriter -> gzp -> compressed file
+            let hashing_writer = HashingWriter::new(parz);
+            let mut tar_builder = tar::Builder::new(hashing_writer);
+            tar_builder.follow_symlinks(false);
+
+            create_layer(&mut tar_builder, upper, &lower_analysis)?;
+
+            let (mut parz, digest) = tar_builder.into_inner()?.finish();
+            parz.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
+            digest
+        };
+
+        let mut blob = Blob::new(
+            global_conf,
+            Some("application/vnd.oci.image.layer.v1.tar+gzip"),
+        );
+        blob.create_from_path(compressed_tmp.path())?;
+        new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
+
+        let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
+        return Ok((new_layer_descs, new_diff_ids));
+    }
+
+    // No compression: tar -> hash -> temp file -> blob
     let mut tmp_file = tempfile::tempfile_in(tmp_dir)
         .or_else(|_| tempfile::tempfile())?;
 
-    // Build the tar while computing SHA256 hash (eliminates separate hashing pass)
     let tar_hexdigest = {
         let hashing_writer = HashingWriter::new(&mut tmp_file);
         let mut tar_builder = tar::Builder::new(hashing_writer);
         tar_builder.follow_symlinks(false);
 
-        // Open lower tars
-        let mut lower_archives: Vec<tar::Archive<Box<dyn Read>>> = Vec::new();
-        for lower_path in lowers {
-            let f = fs::File::open(lower_path)?;
-            let reader: Box<dyn Read> = if global_conf.compression == Compression::Gzip {
-                Box::new(GzDecoder::new(BufReader::new(f)))
-            } else {
-                Box::new(BufReader::new(f))
-            };
-            lower_archives.push(tar::Archive::new(reader));
-        }
-
-        let lower_analysis = analyze_lowers(&mut lower_archives)?;
         create_layer(&mut tar_builder, upper, &lower_analysis)?;
         tar_builder.into_inner()?.finish().1
     };
 
     tmp_file.seek(SeekFrom::Start(0))?;
 
-    let mut new_layer_descs = Vec::new();
-
-    if global_conf.compression == Compression::Gzip {
-        let mut blob = Blob::new(
-            global_conf,
-            Some("application/vnd.oci.image.layer.v1.tar+gzip"),
-        );
-        // Parallel gzip compression via gzp
-        let compressed_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
-        {
-            let level = global_conf.compression_level.unwrap_or(5) as u32;
-            let mut parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
-                .num_threads(global_conf.workers)
-                .map_err(|e| anyhow::anyhow!("gzp thread config: {}", e))?
-                .compression_level(gzp::Compression::new(level))
-                .from_writer(BufWriter::new(compressed_tmp.reopen()?));
-            let mut buf = [0u8; IO_BUF_SIZE];
-            loop {
-                let n = tmp_file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                parz.write_all(&buf[..n])?;
-            }
-            parz.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
-        }
-        blob.create_from_path(compressed_tmp.path())?;
-        new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
-    } else {
-        let mut blob = Blob::new(
-            global_conf,
-            Some("application/vnd.oci.image.layer.v1.tar"),
-        );
-        blob.create(|out| {
-            io::copy(&mut tmp_file, out)?;
-            Ok(())
-        })?;
-        new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
-    }
+    let mut blob = Blob::new(
+        global_conf,
+        Some("application/vnd.oci.image.layer.v1.tar"),
+    );
+    blob.create(|out| {
+        io::copy(&mut tmp_file, out)?;
+        Ok(())
+    })?;
+    new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
 
     let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
 

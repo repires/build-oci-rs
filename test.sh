@@ -840,6 +840,74 @@ fi
 
 rm -rf "$WORKDIR"
 
+# --------------------------------------------------
+# Test 11: Workers / parallel build (-j flag)
+# --------------------------------------------------
+echo ""
+echo "Test 11: Workers flag (-j / --workers)"
+
+WORKDIR=$(mktemp -d)
+cd "$WORKDIR"
+
+# Create rootfs with a few files
+mkdir -p rootfs/bin rootfs/etc
+echo "hello" > rootfs/bin/app
+echo "config" > rootfs/etc/app.conf
+
+# Test -j1 (single worker)
+build-oci -j 1 <<'YAML'
+compression: gzip
+images:
+  - architecture: amd64
+    os: linux
+    layer: rootfs
+YAML
+
+if [ -f "$WORKDIR/index.json" ] && jq -e '.manifests[0]' "$WORKDIR/index.json" >/dev/null 2>&1; then
+    pass "-j 1 produces valid OCI image"
+else
+    fail "-j 1" "did not produce valid OCI image"
+fi
+rm -rf "$WORKDIR/blobs" "$WORKDIR/index.json" "$WORKDIR/oci-layout"
+
+# Test --workers 2
+build-oci --workers 2 <<'YAML'
+compression: gzip
+images:
+  - architecture: amd64
+    os: linux
+    layer: rootfs
+  - architecture: arm64
+    os: linux
+    layer: rootfs
+YAML
+
+NMANIFESTS=$(jq '.manifests | length' "$WORKDIR/index.json" 2>/dev/null)
+if [ "$NMANIFESTS" = "2" ]; then
+    pass "--workers 2 builds multi-arch image with 2 manifests"
+else
+    fail "--workers 2" "expected 2 manifests, got $NMANIFESTS"
+fi
+
+# Test -j4 (no space format)
+rm -rf "$WORKDIR/blobs" "$WORKDIR/index.json" "$WORKDIR/oci-layout"
+
+build-oci -j4 <<'YAML'
+compression: gzip
+images:
+  - architecture: amd64
+    os: linux
+    layer: rootfs
+YAML
+
+if [ -f "$WORKDIR/index.json" ]; then
+    pass "-j4 (no space) flag accepted"
+else
+    fail "-j4" "did not produce output"
+fi
+
+rm -rf "$WORKDIR"
+
 
 # ======================================================================
 echo ""

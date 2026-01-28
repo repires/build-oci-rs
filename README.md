@@ -1,11 +1,12 @@
 # build-oci-rs
 
-A Rust rewrite of the [Freedesktop SDK](https://gitlab.com/nickelfor/nickelfor) OCI image builder, originally written in Python. Builds OCI-compliant container images from YAML configuration provided via stdin.
+A Rust rewrite of the [Freedesktop SDK](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/tree/master/files/oci) OCI image builder, originally written in Python. Builds OCI-compliant container images from YAML configuration provided via stdin.
 
 ## Features
 
 - Builds OCI images compliant with the [OCI Image Spec](https://github.com/opencontainers/image-spec)
 - Gzip or uncompressed layer support
+- Parallel image building with configurable worker threads (`-j` / `--workers`)
 - Layer deduplication (skips unchanged files)
 - Whiteout handling for file deletions (overlay filesystem semantics)
 - Extended attribute (xattr) preservation
@@ -65,6 +66,20 @@ The binary is placed at `target/release/build-oci`.
 
 ```bash
 cat config.yaml | build-oci
+```
+
+### CLI options
+
+| Flag | Description |
+|------|-------------|
+| `-j N` / `--workers N` | Number of parallel worker threads (default: number of CPU cores) |
+
+```bash
+# Build using 4 parallel workers
+cat config.yaml | build-oci -j 4
+
+# Build single-threaded
+cat config.yaml | build-oci -j 1
 ```
 
 ### YAML configuration format
@@ -154,14 +169,29 @@ docker build -t build-oci .
 docker run --rm build-oci
 ```
 
-The test suite covers:
+The test suite (78 assertions across 14 tests) covers:
+
+**Rust binary tests (11 tests):**
 - Binary availability
 - Minimal image build (no layers)
 - Image build with filesystem layers
 - Disabled compression mode
 - Multi-image index builds
 - SHA256 blob digest integrity
-- SOURCE_DATE_EPOCH reproducibility
+- `SOURCE_DATE_EPOCH` reproducibility
+- Stress test (500 files, ~2 MB layer)
+- File permissions and ownership preservation
+- OCI annotation propagation
+- Workers flag (`-j`, `--workers`, `-jN`)
+
+**Python vs Rust comparison tests (3 tests):**
+- Structural equivalence of generated OCI config JSON
+- Layer media type and count parity
+- Performance benchmark (Rust vs Python on 2000-file layer)
+
+## Original Python source
+
+The `python-original/` directory contains the original Python implementation from the [Freedesktop SDK OCI builder](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/tree/master/files/oci) for reference and comparison testing.
 
 ## License
 

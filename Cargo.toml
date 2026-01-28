@@ -20,6 +20,7 @@ tempfile = "3"
 xattr = "1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+rayon = "1.10"
 
 [profile.release]
 opt-level = 3

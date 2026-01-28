@@ -19,17 +19,20 @@
 // SOFTWARE.
 
 use std::fs;
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::blob::Blob;
 use crate::layer_builder::{analyze_lowers, create_layer};
 use crate::{Compression, GlobalConfig};
+
+const IO_BUF_SIZE: usize = 128 * 1024;
 
 fn get_source_date_epoch() -> Option<u64> {
     std::env::var("SOURCE_DATE_EPOCH")
@@ -168,7 +171,7 @@ pub fn build_layer(
     // Calculate SHA256 of the tar
     tmp_file.seek(SeekFrom::Start(0))?;
     let mut tar_hasher = Sha256::new();
-    let mut buf = [0u8; 16 * 1024];
+    let mut buf = [0u8; IO_BUF_SIZE];
     loop {
         let n = tmp_file.read(&mut buf)?;
         if n == 0 {
@@ -346,12 +349,25 @@ pub fn build_images(
     images: &[serde_json::Value],
     annotations: Option<&serde_json::Value>,
 ) -> Result<()> {
-    let mut manifests = Vec::new();
+    // Ensure blob output directory exists before parallel work
+    let blob_dir = Path::new(&global_conf.output).join("blobs").join("sha256");
+    fs::create_dir_all(&blob_dir)?;
 
-    for image in images {
-        let manifest = build_image(global_conf, image)?;
-        manifests.push(manifest);
-    }
+    let manifests: Result<Vec<serde_json::Value>> = if images.len() > 1 && global_conf.workers > 1
+    {
+        // Build images in parallel
+        images
+            .par_iter()
+            .map(|image| build_image(global_conf, image))
+            .collect()
+    } else {
+        // Single image or single worker — sequential
+        images
+            .iter()
+            .map(|image| build_image(global_conf, image))
+            .collect()
+    };
+    let manifests = manifests?;
 
     let mut index = serde_json::json!({
         "schemaVersion": 2,
@@ -362,14 +378,14 @@ pub fn build_images(
     }
 
     let index_path = Path::new(&global_conf.output).join("index.json");
-    let index_file = fs::File::create(&index_path)?;
+    let index_file = BufWriter::new(fs::File::create(&index_path)?);
     serde_json::to_writer(index_file, &index)?;
 
     let layout = serde_json::json!({
         "imageLayoutVersion": "1.0.0",
     });
     let layout_path = Path::new(&global_conf.output).join("oci-layout");
-    let layout_file = fs::File::create(&layout_path)?;
+    let layout_file = BufWriter::new(fs::File::create(&layout_path)?);
     serde_json::to_writer(layout_file, &layout)?;
 
     Ok(())

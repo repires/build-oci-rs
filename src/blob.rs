@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -27,6 +27,8 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::GlobalConfig;
+
+const IO_BUF_SIZE: usize = 128 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BlobDescriptor {
@@ -88,7 +90,7 @@ impl Blob {
 
             // Calculate SHA256
             let mut hasher = Sha256::new();
-            let mut buf = [0u8; 16 * 1024];
+            let mut buf = [0u8; IO_BUF_SIZE];
             loop {
                 let n = tmp.read(&mut buf)?;
                 if n == 0 {
@@ -113,10 +115,9 @@ impl Blob {
             self.filename = Some(dest.clone());
 
             // Persist the temp file to final location
-            tmp.as_file().seek(SeekFrom::Start(0))?;
-            let mut dest_file = fs::File::create(&dest)?;
             tmp.seek(SeekFrom::Start(0))?;
-            let mut buf = [0u8; 16 * 1024];
+            let mut dest_file = BufWriter::new(fs::File::create(&dest)?);
+            let mut buf = [0u8; IO_BUF_SIZE];
             loop {
                 let n = tmp.read(&mut buf)?;
                 if n == 0 {
@@ -124,6 +125,7 @@ impl Blob {
                 }
                 dest_file.write_all(&buf[..n])?;
             }
+            dest_file.flush()?;
 
             Ok(())
         })();
@@ -143,7 +145,7 @@ impl Blob {
         let size = file.metadata()?.len();
 
         let mut hasher = Sha256::new();
-        let mut buf = [0u8; 16 * 1024];
+        let mut buf = [0u8; IO_BUF_SIZE];
         loop {
             let n = file.read(&mut buf)?;
             if n == 0 {

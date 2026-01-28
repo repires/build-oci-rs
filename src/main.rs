@@ -37,9 +37,35 @@ pub struct GlobalConfig {
     pub compression: Compression,
     pub compression_level: Option<u32>,
     pub output: String,
+    pub workers: usize,
+}
+
+fn parse_workers_arg() -> Option<usize> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "-j" || args[i] == "--workers" {
+            if i + 1 < args.len() {
+                return args[i + 1].parse::<usize>().ok();
+            }
+        } else if args[i].starts_with("-j") {
+            // Handle -j4 (no space)
+            return args[i][2..].parse::<usize>().ok();
+        }
+        i += 1;
+    }
+    None
 }
 
 fn main() -> Result<()> {
+    let workers = parse_workers_arg().unwrap_or_else(|| num_cpus());
+
+    // Configure rayon thread pool
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build_global()
+        .ok(); // Ignore error if already initialized
+
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
 
@@ -76,6 +102,7 @@ fn main() -> Result<()> {
         compression,
         compression_level,
         output,
+        workers,
     };
 
     let images = data
@@ -89,4 +116,10 @@ fn main() -> Result<()> {
     image_builder::build_images(&global_conf, &images, annotations)?;
 
     Ok(())
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }

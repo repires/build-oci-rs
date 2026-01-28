@@ -1,17 +1,19 @@
 # build-oci-rs
 
-A Rust rewrite of the [Freedesktop SDK](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/tree/master/files/oci) OCI image builder, originally written in Python. Builds OCI-compliant container images from YAML configuration provided via stdin.
+A high-performance OCI image builder written in Rust. Builds [OCI-compliant](https://github.com/opencontainers/image-spec) container images from YAML configuration provided via stdin.
+
+Built as a faster replacement for the Python-based builder in the [Freedesktop SDK](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/tree/master/files/oci) pipeline.
 
 ## Features
 
-- Builds OCI images compliant with the [OCI Image Spec](https://github.com/opencontainers/image-spec)
-- Gzip or uncompressed layer support
 - Parallel image building with configurable worker threads (`-j` / `--workers`)
-- Layer deduplication (skips unchanged files)
-- Whiteout handling for file deletions (overlay filesystem semantics)
-- Extended attribute (xattr) preservation
+- 128 KB buffered I/O for layer packing, hashing, and compression
+- Gzip compression with tunable level (1-9)
+- Layer deduplication (skips unchanged files against parent layers)
+- Multi-image index output (multi-arch builds)
 - Reproducible builds via `SOURCE_DATE_EPOCH`
-- Multi-image index output (multi-arch support)
+- Whiteout handling for overlay filesystem semantics
+- Extended attribute (xattr) preservation
 - Parent image composition
 
 ## Requirements
@@ -171,8 +173,7 @@ docker run --rm build-oci
 
 The test suite (78 assertions across 14 tests) covers:
 
-**Rust binary tests (11 tests):**
-- Binary availability
+- Binary availability and error handling
 - Minimal image build (no layers)
 - Image build with filesystem layers
 - Disabled compression mode
@@ -183,15 +184,11 @@ The test suite (78 assertions across 14 tests) covers:
 - File permissions and ownership preservation
 - OCI annotation propagation
 - Workers flag (`-j`, `--workers`, `-jN`)
+- Optional: comparison against the original Python builder (structural equivalence + performance benchmark)
 
-**Python vs Rust comparison tests (3 tests):**
-- Structural equivalence of generated OCI config JSON
-- Layer media type and count parity
-- Performance benchmark (Rust vs Python on 2000-file layer)
+## Python reference
 
-## Original Python source
-
-The `python-original/` directory contains the original Python implementation from the [Freedesktop SDK OCI builder](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/tree/master/files/oci) for reference and comparison testing.
+The `python-original/` directory contains the original Python implementation from the [Freedesktop SDK OCI builder](https://gitlab.com/freedesktop-sdk/freedesktop-sdk/-/tree/master/files/oci). It is included for anyone who wants to inspect or compare the two implementations. The test suite optionally runs comparison tests when the Python builder is available in the container.
 
 ## License
 

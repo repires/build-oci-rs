@@ -31,6 +31,39 @@ use gzp::ZWriter;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
+/// A writer wrapper that computes SHA256 hash while writing.
+/// This eliminates a separate hashing pass over the data.
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        HashingWriter {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finish(self) -> (W, String) {
+        let digest = format!("{:x}", self.hasher.finalize());
+        (self.inner, digest)
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 use crate::blob::Blob;
 use crate::layer_builder::{analyze_lowers, create_layer};
 use crate::{Compression, GlobalConfig};
@@ -149,9 +182,10 @@ pub fn build_layer(
     let mut tmp_file = tempfile::tempfile_in(tmp_dir)
         .or_else(|_| tempfile::tempfile())?;
 
-    // Build the tar
-    {
-        let mut tar_builder = tar::Builder::new(&mut tmp_file);
+    // Build the tar while computing SHA256 hash (eliminates separate hashing pass)
+    let tar_hexdigest = {
+        let hashing_writer = HashingWriter::new(&mut tmp_file);
+        let mut tar_builder = tar::Builder::new(hashing_writer);
         tar_builder.follow_symlinks(false);
 
         // Open lower tars
@@ -168,21 +202,8 @@ pub fn build_layer(
 
         let lower_analysis = analyze_lowers(&mut lower_archives)?;
         create_layer(&mut tar_builder, upper, &lower_analysis)?;
-        tar_builder.finish()?;
-    }
-
-    // Calculate SHA256 of the tar
-    tmp_file.seek(SeekFrom::Start(0))?;
-    let mut tar_hasher = Sha256::new();
-    let mut buf = [0u8; IO_BUF_SIZE];
-    loop {
-        let n = tmp_file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        tar_hasher.update(&buf[..n]);
-    }
-    let tar_hexdigest = format!("{:x}", tar_hasher.finalize());
+        tar_builder.into_inner()?.finish().1
+    };
 
     tmp_file.seek(SeekFrom::Start(0))?;
 

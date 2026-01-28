@@ -231,8 +231,8 @@ fn collect_regular_files_recursive(dir: &Path, result: &mut Vec<PathBuf>) {
     }
 }
 
-/// Hash all regular files in parallel using rayon, returning a map of
-/// path -> (sha256_checksum, xattrs).
+/// Hash all regular files in parallel using rayon.
+/// Returns a map of path -> (sha256_checksum, xattrs).
 fn prehash_regular_files(upper: &Path) -> HashMap<PathBuf, FileHashData> {
     let files = collect_regular_files(upper);
     files

@@ -20,11 +20,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use memmap2::Mmap;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use tar;
@@ -203,10 +205,29 @@ fn attr_set(pax: &HashMap<String, String>) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-/// Pre-computed hash and xattr data for a regular file.
+/// Threshold for using mmap vs reading into memory
+const MMAP_THRESHOLD: u64 = 64 * 1024; // 64KB
+
+/// Cached file contents - either in-memory or memory-mapped
+enum FileContents {
+    InMemory(Vec<u8>),
+    Mapped(Arc<Mmap>),
+}
+
+impl FileContents {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            FileContents::InMemory(v) => v.as_slice(),
+            FileContents::Mapped(m) => m.as_ref(),
+        }
+    }
+}
+
+/// Pre-computed hash, xattr data, and cached contents for a regular file.
 struct FileHashData {
     checksum: String,
     xattrs: Vec<(String, String)>,
+    contents: Option<FileContents>,
 }
 
 /// Recursively collect all regular file paths under a directory.
@@ -231,17 +252,48 @@ fn collect_regular_files_recursive(dir: &Path, result: &mut Vec<PathBuf>) {
     }
 }
 
-/// Hash all regular files in parallel using rayon.
-/// Returns a map of path -> (sha256_checksum, xattrs).
-fn prehash_regular_files(upper: &Path) -> HashMap<PathBuf, FileHashData> {
+/// Hash and prefetch all regular files in parallel using rayon.
+/// Small files are read into memory, large files are memory-mapped.
+/// Returns a map of path -> (sha256_checksum, xattrs, cached_contents).
+fn prehash_and_prefetch_files(upper: &Path) -> HashMap<PathBuf, FileHashData> {
     let files = collect_regular_files(upper);
     files
         .par_iter()
-        .map(|path| {
-            let checksum = xattr_sha256(path)
-                .unwrap_or_else(|| file_sha256(path).unwrap_or_default());
+        .filter_map(|path| {
+            let meta = fs::metadata(path).ok()?;
+            let file_size = meta.len();
+
+            // Try to get checksum from xattr first
+            let xattr_checksum = xattr_sha256(path);
+
+            // Load file contents (mmap for large files, read for small)
+            let (contents, checksum) = if file_size >= MMAP_THRESHOLD {
+                // Large file: use mmap
+                let file = fs::File::open(path).ok()?;
+                let mmap = unsafe { Mmap::map(&file).ok()? };
+
+                let checksum = xattr_checksum.unwrap_or_else(|| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&mmap[..]);
+                    format!("{:x}", hasher.finalize())
+                });
+
+                (Some(FileContents::Mapped(Arc::new(mmap))), checksum)
+            } else {
+                // Small file: read into memory
+                let data = fs::read(path).ok()?;
+
+                let checksum = xattr_checksum.unwrap_or_else(|| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&data);
+                    format!("{:x}", hasher.finalize())
+                });
+
+                (Some(FileContents::InMemory(data)), checksum)
+            };
+
             let xattrs = get_all_xattr(path);
-            (path.clone(), FileHashData { checksum, xattrs })
+            Some((path.clone(), FileHashData { checksum, xattrs, contents }))
         })
         .collect()
 }
@@ -256,8 +308,8 @@ pub fn create_layer<W: std::io::Write>(
             .expect("SOURCE_DATE_EPOCH must be a valid integer")
     });
 
-    // Pre-hash all regular files in parallel before sequential tar writing
-    let file_hashes = prehash_regular_files(upper);
+    // Pre-hash and prefetch all regular files in parallel before sequential tar writing
+    let file_hashes = prehash_and_prefetch_files(upper);
 
     let mut stack: Vec<PathBuf> = vec![upper.to_path_buf()];
 
@@ -460,8 +512,20 @@ pub fn create_layer<W: std::io::Write>(
 
             header.set_cksum();
             if is_regular {
-                let f = fs::File::open(&path)?;
-                output.append_data(&mut header, &rel, f)?;
+                // Use prefetched contents (avoids re-reading from disk)
+                if let Some(hash_data) = file_hashes.get(&path) {
+                    if let Some(ref contents) = hash_data.contents {
+                        output.append_data(&mut header, &rel, contents.as_slice())?;
+                    } else {
+                        // Fallback: no cached contents
+                        let f = fs::File::open(&path)?;
+                        output.append_data(&mut header, &rel, f)?;
+                    }
+                } else {
+                    // Fallback: file not in hash map
+                    let f = fs::File::open(&path)?;
+                    output.append_data(&mut header, &rel, f)?;
+                }
             } else {
                 output.append_data(&mut header, &rel, &[] as &[u8])?;
             }

@@ -23,6 +23,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -33,17 +34,25 @@ use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 use tar;
 
+use crate::GlobalConfig;
+
 pub const PAX_HEADER_SHA256: &str = "freedesktopsdk.checksum.sha256";
 pub const PAX_HEADER_XATTR: &str = "SCHILY.xattr.";
 
-pub fn xattr_sha256(path: &Path) -> Option<String> {
+pub fn xattr_sha256(path: &Path, skip_xattrs: bool) -> Option<String> {
+    if skip_xattrs {
+        return None;
+    }
     match xattr::get(path, "user.checksum.sha256") {
         Ok(Some(val)) => Some(String::from_utf8_lossy(&val).to_string()),
         _ => None,
     }
 }
 
-pub fn get_all_xattr(path: &Path) -> Vec<(String, String)> {
+pub fn get_all_xattr(path: &Path, skip_xattrs: bool) -> Vec<(String, String)> {
+    if skip_xattrs {
+        return Vec::new();
+    }
     let mut result = Vec::new();
     if let Ok(attrs) = xattr::list(path) {
         for attr_name in attrs {
@@ -290,22 +299,29 @@ fn collect_regular_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Hash and prefetch all regular files in parallel using rayon.
-/// Small files are read into memory, large files are memory-mapped.
+/// Small files are read into memory (up to memory limit), large files are memory-mapped.
 /// Returns a map of path -> (sha256_checksum, xattrs, cached_contents).
-fn prehash_and_prefetch_files(upper: &Path) -> FxHashMap<PathBuf, FileHashData> {
+fn prehash_and_prefetch_files(upper: &Path, config: &GlobalConfig) -> FxHashMap<PathBuf, FileHashData> {
     let files = collect_regular_files(upper);
+    let memory_limit = config.prefetch_limit_mb * 1024 * 1024;
+    let memory_used = Arc::new(AtomicUsize::new(0));
+    let skip_xattrs = config.skip_xattrs;
+
     files
         .par_iter()
         .filter_map(|path| {
             let meta = fs::metadata(path).ok()?;
             let file_size = meta.len();
 
-            // Try to get checksum from xattr first
-            let xattr_checksum = xattr_sha256(path);
+            // Try to get checksum from xattr first (fast path)
+            let xattr_checksum = xattr_sha256(path, skip_xattrs);
 
-            // Load file contents (mmap for large files, read for small)
+            // Check if we can cache this file's contents
+            let current_memory = memory_used.load(Ordering::Relaxed);
+            let can_cache = current_memory + (file_size as usize) <= memory_limit;
+
             let (contents, checksum) = if file_size >= MMAP_THRESHOLD {
-                // Large file: use mmap
+                // Large file: use mmap (doesn't count against memory limit - OS manages it)
                 let file = fs::File::open(path).ok()?;
                 let mmap = unsafe { Mmap::map(&file).ok()? };
 
@@ -316,9 +332,10 @@ fn prehash_and_prefetch_files(upper: &Path) -> FxHashMap<PathBuf, FileHashData> 
                 });
 
                 (Some(FileContents::Mapped(Arc::new(mmap))), checksum)
-            } else {
-                // Small file: read into memory
+            } else if can_cache {
+                // Small file within memory budget: read into memory
                 let data = fs::read(path).ok()?;
+                memory_used.fetch_add(data.len(), Ordering::Relaxed);
 
                 let checksum = xattr_checksum.unwrap_or_else(|| {
                     let mut hasher = Sha256::new();
@@ -327,9 +344,15 @@ fn prehash_and_prefetch_files(upper: &Path) -> FxHashMap<PathBuf, FileHashData> 
                 });
 
                 (Some(FileContents::InMemory(data)), checksum)
+            } else {
+                // Memory budget exceeded: compute hash only, don't cache contents
+                let checksum = xattr_checksum.unwrap_or_else(|| {
+                    file_sha256(path).unwrap_or_default()
+                });
+                (None, checksum)
             };
 
-            let xattrs = get_all_xattr(path);
+            let xattrs = get_all_xattr(path, skip_xattrs);
             Some((path.clone(), FileHashData { checksum, xattrs, contents }))
         })
         .collect()
@@ -339,6 +362,7 @@ pub fn create_layer<W: std::io::Write>(
     output: &mut tar::Builder<W>,
     upper: &Path,
     lower_analysis: &LowerAnalysis,
+    config: &GlobalConfig,
 ) -> Result<()> {
     let epoch = std::env::var("SOURCE_DATE_EPOCH").ok().map(|e| {
         e.parse::<u64>()
@@ -346,7 +370,8 @@ pub fn create_layer<W: std::io::Write>(
     });
 
     // Pre-hash and prefetch all regular files in parallel before sequential tar writing
-    let file_hashes = prehash_and_prefetch_files(upper);
+    let file_hashes = prehash_and_prefetch_files(upper, config);
+    let skip_xattrs = config.skip_xattrs;
 
     let mut stack: Vec<PathBuf> = vec![upper.to_path_buf()];
 
@@ -473,10 +498,10 @@ pub fn create_layer<W: std::io::Write>(
                     }
                 } else {
                     // Fallback (shouldn't happen)
-                    checksum = xattr_sha256(&path).unwrap_or_else(|| {
+                    checksum = xattr_sha256(&path, skip_xattrs).unwrap_or_else(|| {
                         file_sha256(&path).unwrap_or_default()
                     });
-                    for (attr, value) in get_all_xattr(&path) {
+                    for (attr, value) in get_all_xattr(&path, skip_xattrs) {
                         pax_headers.insert(format!("{}{}", PAX_HEADER_XATTR, attr), value);
                     }
                 }

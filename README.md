@@ -114,6 +114,10 @@ cat config.yaml | build-oci -j 1
 compression: zstd
 compression-level: 3          # zstd: 1-22 (default 3), gzip: 1-9 (default 5)
 
+# Performance tuning (optional)
+skip-xattrs: false            # Skip xattr handling for faster builds (default: false)
+prefetch-limit-mb: 512        # Memory limit for file prefetch cache in MB (default: 512)
+
 # Optional top-level annotations added to the OCI index
 annotations:
   org.opencontainers.image.description: "My container image"
@@ -257,6 +261,8 @@ Parallel speedup: **~3.5x** on multi-core systems.
 | FxHashMap deduplication | 10-25% |
 | Parallel lower analysis | 2-4x (4+ parent layers) |
 | Zstd vs gzip | 2-5x compression speed |
+| skip-xattrs: true | 10-30% (eliminates syscalls) |
+| Memory-bounded prefetch | Prevents OOM on large dirs |
 
 Compared to the original Python implementation: **~3x faster** on the test suite benchmark.
 

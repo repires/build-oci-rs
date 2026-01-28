@@ -252,7 +252,7 @@ pub fn build_layer(
                 let mut tar_builder = tar::Builder::new(diff_hasher);
                 tar_builder.follow_symlinks(false);
 
-                create_layer(&mut tar_builder, upper, &lower_analysis)?;
+                create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
 
                 let (mut parz, diff_digest) = tar_builder.into_inner()?.finish();
                 parz.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
@@ -284,7 +284,7 @@ pub fn build_layer(
                 let mut tar_builder = tar::Builder::new(diff_hasher);
                 tar_builder.follow_symlinks(false);
 
-                create_layer(&mut tar_builder, upper, &lower_analysis)?;
+                create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
 
                 let (zstd_encoder, diff_digest) = tar_builder.into_inner()?.finish();
                 zstd_encoder.finish()?;
@@ -311,7 +311,7 @@ pub fn build_layer(
                 let mut tar_builder = tar::Builder::new(hashing_writer);
                 tar_builder.follow_symlinks(false);
 
-                create_layer(&mut tar_builder, upper, &lower_analysis)?;
+                create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
                 tar_builder.into_inner()?.finish().1
             };
 

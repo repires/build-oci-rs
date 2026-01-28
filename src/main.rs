@@ -46,6 +46,8 @@ pub struct GlobalConfig {
     pub compression_level: Option<u32>,
     pub output: String,
     pub workers: usize,
+    pub skip_xattrs: bool,
+    pub prefetch_limit_mb: usize,
 }
 
 fn parse_workers_arg() -> Option<usize> {
@@ -107,11 +109,24 @@ fn main() -> Result<()> {
         .to_string_lossy()
         .to_string();
 
+    let skip_xattrs = data
+        .get("skip-xattrs")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let prefetch_limit_mb = data
+        .get("prefetch-limit-mb")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(512); // Default 512MB limit for prefetch cache
+
     let global_conf = GlobalConfig {
         compression,
         compression_level,
         output,
         workers,
+        skip_xattrs,
+        prefetch_limit_mb,
     };
 
     let images = data

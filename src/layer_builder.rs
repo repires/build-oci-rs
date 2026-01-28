@@ -25,6 +25,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use tar;
 
@@ -202,6 +203,49 @@ fn attr_set(pax: &HashMap<String, String>) -> BTreeSet<(String, String)> {
         .collect()
 }
 
+/// Pre-computed hash and xattr data for a regular file.
+struct FileHashData {
+    checksum: String,
+    xattrs: Vec<(String, String)>,
+}
+
+/// Recursively collect all regular file paths under a directory.
+fn collect_regular_files(dir: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    collect_regular_files_recursive(dir, &mut result);
+    result
+}
+
+fn collect_regular_files_recursive(dir: &Path, result: &mut Vec<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                let path = entry.path();
+                if ft.is_dir() {
+                    collect_regular_files_recursive(&path, result);
+                } else if ft.is_file() {
+                    result.push(path);
+                }
+            }
+        }
+    }
+}
+
+/// Hash all regular files in parallel using rayon, returning a map of
+/// path -> (sha256_checksum, xattrs).
+fn prehash_regular_files(upper: &Path) -> HashMap<PathBuf, FileHashData> {
+    let files = collect_regular_files(upper);
+    files
+        .par_iter()
+        .map(|path| {
+            let checksum = xattr_sha256(path)
+                .unwrap_or_else(|| file_sha256(path).unwrap_or_default());
+            let xattrs = get_all_xattr(path);
+            (path.clone(), FileHashData { checksum, xattrs })
+        })
+        .collect()
+}
+
 pub fn create_layer<W: std::io::Write>(
     output: &mut tar::Builder<W>,
     upper: &Path,
@@ -211,6 +255,9 @@ pub fn create_layer<W: std::io::Write>(
         e.parse::<u64>()
             .expect("SOURCE_DATE_EPOCH must be a valid integer")
     });
+
+    // Pre-hash all regular files in parallel before sequential tar writing
+    let file_hashes = prehash_regular_files(upper);
 
     let mut stack: Vec<PathBuf> = vec![upper.to_path_buf()];
 
@@ -326,15 +373,25 @@ pub fn create_layer<W: std::io::Write>(
                 header.set_entry_type(tar::EntryType::Regular);
                 header.set_size(meta.len());
 
-                // Get checksum
-                checksum = xattr_sha256(&path).unwrap_or_else(|| {
-                    file_sha256(&path).unwrap_or_default()
-                });
-                pax_headers.insert(PAX_HEADER_SHA256.to_string(), checksum.clone());
-
-                for (attr, value) in get_all_xattr(&path) {
-                    pax_headers.insert(format!("{}{}", PAX_HEADER_XATTR, attr), value);
+                // Use pre-computed hash from parallel phase
+                if let Some(hash_data) = file_hashes.get(&path) {
+                    checksum = hash_data.checksum.clone();
+                    for (attr, value) in &hash_data.xattrs {
+                        pax_headers.insert(
+                            format!("{}{}", PAX_HEADER_XATTR, attr),
+                            value.clone(),
+                        );
+                    }
+                } else {
+                    // Fallback (shouldn't happen)
+                    checksum = xattr_sha256(&path).unwrap_or_else(|| {
+                        file_sha256(&path).unwrap_or_default()
+                    });
+                    for (attr, value) in get_all_xattr(&path) {
+                        pax_headers.insert(format!("{}{}", PAX_HEADER_XATTR, attr), value);
+                    }
                 }
+                pax_headers.insert(PAX_HEADER_SHA256.to_string(), checksum.clone());
             } else if is_symlink {
                 header.set_entry_type(tar::EntryType::Symlink);
                 header.set_size(0);

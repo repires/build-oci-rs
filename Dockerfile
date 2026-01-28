@@ -1,5 +1,8 @@
 FROM rust:1.83-bookworm AS builder
 
+# Install cmake for libz-sys (required by gzp)
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 
 # Copy source

@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use gzp::deflate::Gzip;
+use gzp::par::compress::ParCompress;
+use gzp::ZWriter;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -190,14 +193,24 @@ pub fn build_layer(
             global_conf,
             Some("application/vnd.oci.image.layer.v1.tar+gzip"),
         );
-        blob.create(|out| {
-            let level =
-                flate2::Compression::new(global_conf.compression_level.unwrap_or(5) as u32);
-            let mut encoder = GzEncoder::new(std::io::Write::by_ref(out), level);
-            io::copy(&mut tmp_file, &mut encoder)?;
-            encoder.finish()?;
-            Ok(())
-        })?;
+        // Parallel gzip compression via gzp
+        let compressed_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
+        {
+            let level = global_conf.compression_level.unwrap_or(5) as u32;
+            let mut parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
+                .compression_level(gzp::Compression::new(level))
+                .from_writer(BufWriter::new(compressed_tmp.reopen()?));
+            let mut buf = [0u8; IO_BUF_SIZE];
+            loop {
+                let n = tmp_file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                parz.write_all(&buf[..n])?;
+            }
+            parz.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
+        }
+        blob.create_from_path(compressed_tmp.path())?;
         new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
     } else {
         let mut blob = Blob::new(

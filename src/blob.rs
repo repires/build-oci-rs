@@ -88,15 +88,24 @@ impl Blob {
             let size = tmp.seek(SeekFrom::End(0))?;
             tmp.seek(SeekFrom::Start(0))?;
 
-            // Calculate SHA256
+            let blob_dir = self.output_dir.join("blobs").join("sha256");
+            fs::create_dir_all(&blob_dir)?;
+
+            // Hash and copy in a single pass (eliminates one full read)
+            let dest_tmp = NamedTempFile::new_in(&blob_dir)?;
             let mut hasher = Sha256::new();
-            let mut buf = [0u8; IO_BUF_SIZE];
-            loop {
-                let n = tmp.read(&mut buf)?;
-                if n == 0 {
-                    break;
+            {
+                let mut dest_writer = BufWriter::new(dest_tmp.reopen()?);
+                let mut buf = [0u8; IO_BUF_SIZE];
+                loop {
+                    let n = tmp.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                    dest_writer.write_all(&buf[..n])?;
                 }
-                hasher.update(&buf[..n]);
+                dest_writer.flush()?;
             }
             let hexdigest = format!("{:x}", hasher.finalize());
 
@@ -108,24 +117,9 @@ impl Blob {
                 annotations: None,
             });
 
-            let blob_dir = self.output_dir.join("blobs").join("sha256");
-            fs::create_dir_all(&blob_dir)?;
-
             let dest = blob_dir.join(&hexdigest);
             self.filename = Some(dest.clone());
-
-            // Persist the temp file to final location
-            tmp.seek(SeekFrom::Start(0))?;
-            let mut dest_file = BufWriter::new(fs::File::create(&dest)?);
-            let mut buf = [0u8; IO_BUF_SIZE];
-            loop {
-                let n = tmp.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                dest_file.write_all(&buf[..n])?;
-            }
-            dest_file.flush()?;
+            dest_tmp.persist(&dest).map_err(|e| anyhow::anyhow!("persist blob: {}", e))?;
 
             Ok(())
         })();
@@ -144,14 +138,21 @@ impl Blob {
         let mut file = fs::File::open(source_path)?;
         let size = file.metadata()?.len();
 
+        // Hash and copy in a single pass
+        let dest_tmp = NamedTempFile::new_in(&blob_dir)?;
         let mut hasher = Sha256::new();
-        let mut buf = [0u8; IO_BUF_SIZE];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
+        {
+            let mut dest_writer = BufWriter::new(dest_tmp.reopen()?);
+            let mut buf = [0u8; IO_BUF_SIZE];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                dest_writer.write_all(&buf[..n])?;
             }
-            hasher.update(&buf[..n]);
+            dest_writer.flush()?;
         }
         let hexdigest = format!("{:x}", hasher.finalize());
 
@@ -164,8 +165,8 @@ impl Blob {
         });
 
         let dest = blob_dir.join(&hexdigest);
-        fs::copy(source_path, &dest)?;
-        self.filename = Some(dest);
+        self.filename = Some(dest.clone());
+        dest_tmp.persist(&dest).map_err(|e| anyhow::anyhow!("persist blob: {}", e))?;
 
         Ok(())
     }

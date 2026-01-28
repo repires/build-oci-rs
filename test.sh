@@ -2,7 +2,7 @@
 set -e
 
 echo "============================================================"
-echo "  build-oci - Deep Analysis Test Suite (Rust vs Python)"
+echo "  build-oci - Test Suite"
 echo "============================================================"
 echo ""
 
@@ -55,7 +55,7 @@ get_manifest_blob() {
 }
 
 # ======================================================================
-echo "PART 1: RUST BINARY TESTS"
+echo "TESTS"
 echo "--------------------------------------------------------------"
 # ======================================================================
 
@@ -912,17 +912,17 @@ rm -rf "$WORKDIR"
 # ======================================================================
 echo ""
 echo "============================================================"
-echo "PART 2: PYTHON vs RUST COMPARISON"
+echo "OPTIONAL: Python comparison (reference only)"
 echo "--------------------------------------------------------------"
 # ======================================================================
 
 if [ -n "$PYTHON_CMD" ]; then
-    info "Python build-oci available: $PYTHON_CMD"
+    info "Python builder available: $PYTHON_CMD"
 else
     # Try direct invocation
     if command -v build-oci-py >/dev/null 2>&1; then
         PYTHON_CMD="build-oci-py"
-        info "Python build-oci available: $PYTHON_CMD"
+        info "Python builder available: $PYTHON_CMD"
     else
         # Create a wrapper script
         cat > /usr/local/bin/build-oci-py <<'PYEOF'
@@ -935,9 +935,9 @@ PYEOF
         chmod +x /usr/local/bin/build-oci-py
         if echo 'images: [{architecture: amd64, os: linux}]' | build-oci-py 2>/dev/null; then
             PYTHON_CMD="build-oci-py"
-            info "Python build-oci wrapper created successfully"
+            info "Python builder wrapper created successfully"
         else
-            warn "Python comparison" "Python build-oci not available, skipping comparison tests"
+            info "Python builder not available, skipping comparison"
             PYTHON_CMD=""
         fi
     fi
@@ -1196,7 +1196,7 @@ YAML
     rm -rf "$RUST_DIR" "$PY_DIR" "$LAYER_DIR"
 
 else
-    info "Skipping Python comparison tests (Python build-oci not available)"
+    info "Skipping Python comparison (not available in this environment)"
 fi
 
 

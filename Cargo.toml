@@ -1,0 +1,26 @@
+[package]
+name = "build-oci"
+version = "0.1.0"
+edition = "2021"
+description = "Freedesktop SDK OCI image builder"
+license = "MIT"
+
+[[bin]]
+name = "build-oci"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
+xattr = "1"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -25,7 +25,7 @@ use std::io::{BufReader, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use jwalk::WalkDir;
@@ -42,34 +42,7 @@ use crate::GlobalConfig;
 pub const PAX_HEADER_SHA256: &str = "freedesktopsdk.checksum.sha256";
 pub const PAX_HEADER_XATTR: &str = "SCHILY.xattr.";
 
-pub fn xattr_sha256(path: &Path, skip_xattrs: bool) -> Option<String> {
-    if skip_xattrs {
-        return None;
-    }
-    match xattr::get(path, "user.checksum.sha256") {
-        Ok(Some(val)) => Some(String::from_utf8_lossy(&val).to_string()),
-        _ => None,
-    }
-}
-
-pub fn get_all_xattr(path: &Path, skip_xattrs: bool) -> Vec<(String, String)> {
-    if skip_xattrs {
-        return Vec::new();
-    }
-    let mut result = Vec::new();
-    if let Ok(attrs) = xattr::list(path) {
-        for attr_name in attrs {
-            let attr_str = attr_name.to_string_lossy().to_string();
-            if let Ok(Some(val)) = xattr::get(path, &attr_name) {
-                let val_str = String::from_utf8_lossy(&val).to_string();
-                result.push((attr_str, val_str));
-            }
-        }
-    }
-    result
-}
-
-pub fn file_sha256(path: &Path) -> Result<String> {
+fn file_sha256(path: &Path) -> Result<String> {
     let file = fs::File::open(path)?;
     let mut reader = BufReader::with_capacity(IO_BUF_LARGE, file);
     let mut hasher = Sha256::new();
@@ -84,16 +57,20 @@ pub fn file_sha256(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Lower layer entry metadata - field order optimized to reduce struct padding
 #[derive(Debug, Clone)]
 pub struct LowerEntry {
-    pub entry_type: u8,
-    pub uid: u64,
-    pub gid: u64,
-    pub mode: u32,
-    pub mtime: u64,
-    pub size: u64,
+    // 8-byte aligned fields first (pointer-based types)
     pub pax_headers: HashMap<String, String>,
     pub symlink_target: Option<String>,
+    // 8-byte aligned primitives
+    pub uid: u64,
+    pub gid: u64,
+    pub mtime: u64,
+    pub size: u64,
+    // 4-byte aligned, followed by 1-byte - packs efficiently
+    pub mode: u32,
+    pub entry_type: u8,
 }
 
 pub struct LowerAnalysis {
@@ -161,14 +138,14 @@ fn parse_archive<R: Read>(archive: &mut tar::Archive<R>) -> Result<ArchiveEntrie
             };
 
             let le = LowerEntry {
-                entry_type,
-                uid,
-                gid,
-                mode,
-                mtime,
-                size,
                 pax_headers,
                 symlink_target,
+                uid,
+                gid,
+                mtime,
+                size,
+                mode,
+                entry_type,
             };
             entries.push((path_str, le));
         }
@@ -193,29 +170,20 @@ pub fn analyze_lowers<R: Read + Send>(lowers: &mut [tar::Archive<R>]) -> Result<
     let mut lower_files: BTreeMap<String, LowerEntry> = BTreeMap::new();
 
     for archive_entries in parsed {
-        // Apply opaque whiteouts from this layer using optimized range deletion
-        for dirname in &archive_entries.opaque_whiteouts {
-            // Remove everything strictly under "dirname/"
-            // BTreeMap is ordered, so we can use range() to find the start point
-            // However, removing while iterating is tricky. 
-            // `retain` visits everything.
-            // Range scan can find keys to remove.
-            
-            let prefix = format!("{}/", dirname);
-            // Range scan to find keys to remove
-            // Since we can't remove while iterating, and we want to remove a range:
-            // The range starts at `prefix` and ends at `prefix` + some "infinity".
-            // However, BTreeMap doesn't support easy range removal until recent Rust.
-            // We can collect keys.
-            let to_remove: Vec<String> = lower_files
-                .range(prefix.clone()..)
-                .take_while(|(k, _)| k.starts_with(&prefix))
-                .map(|(k, _)| k.clone())
+        // Apply opaque whiteouts from this layer using O(n) retain
+        // More efficient than collecting keys and removing one by one
+        if !archive_entries.opaque_whiteouts.is_empty() {
+            // Build prefixes once for all whiteouts in this layer
+            let prefixes: Vec<String> = archive_entries
+                .opaque_whiteouts
+                .iter()
+                .map(|dirname| format!("{}/", dirname))
                 .collect();
-                
-            for k in to_remove {
-                lower_files.remove(&k);
-            }
+
+            // Single O(n) pass through the map
+            lower_files.retain(|k, _| {
+                !prefixes.iter().any(|prefix| k.starts_with(prefix))
+            });
         }
 
         // Apply file whiteouts from this layer
@@ -244,6 +212,7 @@ pub fn analyze_lowers<R: Read + Send>(lowers: &mut [tar::Archive<R>]) -> Result<
     })
 }
 
+#[inline]
 fn split_path(path: &str) -> (Cow<str>, Cow<str>) {
     let p = Path::new(path);
     let basename = p
@@ -316,14 +285,18 @@ pub struct LayerData {
     pub children: FxHashMap<PathBuf, Vec<String>>,
 }
 
+use dashmap::DashMap;
+
 /// Collect and pre-calculate all data for a directory tree in parallel.
 fn precalculate_layer_data(upper: &Path, config: &GlobalConfig) -> LayerData {
-    let memory_limit = config.prefetch_limit_mb * 1024 * 1024;
+    // Use saturating_mul to prevent overflow on large prefetch limits
+    let memory_limit = config.prefetch_limit_mb.saturating_mul(1024).saturating_mul(1024);
     let memory_used = Arc::new(AtomicUsize::new(0));
     let skip_xattrs = config.skip_xattrs;
 
     // Map of (dev, ino) -> first seen relative path for hardlink detection
-    let inode_map: Arc<Mutex<FxHashMap<(u64, u64), String>>> = Arc::new(Mutex::new(FxHashMap::default()));
+    // Use DashMap for wait-free concurrent access
+    let inode_map: Arc<DashMap<(u64, u64), String>> = Arc::new(DashMap::default());
 
     // Use jwalk to collect all entries (dirs, files, symlinks)
     let all_entries: Vec<jwalk::DirEntry<((), ())>> = WalkDir::new(upper)
@@ -352,7 +325,29 @@ fn precalculate_layer_data(upper: &Path, config: &GlobalConfig) -> LayerData {
                 size: meta.len(),
             };
 
-            let xattrs = get_all_xattr(&full_path, skip_xattrs);
+            // SYSCALL OPTIMIZATION:
+            // Single pass to get all xattrs, diverting checksum if found.
+            // This avoids redundant listxattr + getxattr calls.
+            let mut xattrs = Vec::new();
+            let mut xattr_checksum = None;
+
+            if !skip_xattrs {
+                if let Ok(attrs_list) = xattr::list(&full_path) {
+                    for attr_name in attrs_list {
+                        let attr_str = attr_name.to_string_lossy().to_string();
+                        // Only fetch value if we care about it
+                        if let Ok(Some(val)) = xattr::get(&full_path, &attr_name) {
+                            if attr_str == "user.checksum.sha256" {
+                                xattr_checksum = Some(String::from_utf8_lossy(&val).to_string());
+                            } else {
+                                let val_str = String::from_utf8_lossy(&val).to_string();
+                                xattrs.push((attr_str, val_str));
+                            }
+                        }
+                    }
+                }
+            }
+
             let rel_path = pathdiff(&full_path, upper).into_owned();
 
             let kind = if file_type.is_dir() {
@@ -362,49 +357,56 @@ fn precalculate_layer_data(upper: &Path, config: &GlobalConfig) -> LayerData {
                     .to_string_lossy().to_string();
                 EntryKind::Symlink { target }
             } else if file_type.is_file() {
-                // Hardlink detection
+                // Hardlink detection using DashMap for atomic check-and-insert without manual locking
                 let dev_ino = (meta.dev(), meta.ino());
-                let mut map = inode_map.lock().unwrap();
-                if let Some(first_path) = map.get(&dev_ino) {
-                    EntryKind::Hardlink { target_path: first_path.clone() }
-                } else {
-                    map.insert(dev_ino, rel_path.clone());
-                    drop(map); // Release lock before hashing
+                
+                use dashmap::mapref::entry::Entry;
+                match inode_map.entry(dev_ino) {
+                    Entry::Occupied(e) => {
+                        // Another file with the same inode was already seen - this is a hardlink
+                        EntryKind::Hardlink { target_path: e.get().clone() }
+                    }
+                    Entry::Vacant(e) => {
+                        // First time seeing this inode - insert our path and compute hash
+                        e.insert(rel_path.clone());
+                        
+                        // No lock to drop, DashMap handles it per-shard
 
-                    let file_size = meta.len();
-                    let xattr_checksum = xattr_sha256(&full_path, skip_xattrs);
-                    
-                    let current_memory = memory_used.load(Ordering::Relaxed);
-                    let can_cache = current_memory + (file_size as usize) <= memory_limit;
+                        let file_size = meta.len();
 
-                    let (contents, checksum) = if file_size >= MMAP_THRESHOLD {
-                        let file = fs::File::open(&full_path).ok()?;
-                        // SAFETY: The source filesystem is expected to be stable during OCI builds.
-                        // Files should not be modified or deleted while we hold the mmap.
-                        let mmap = unsafe { Mmap::map(&file).ok()? };
-                        let checksum = xattr_checksum.unwrap_or_else(|| {
-                            let mut hasher = Sha256::new();
-                            hasher.update(&mmap[..]);
-                            format!("{:x}", hasher.finalize())
-                        });
-                        (Some(FileContents::Mapped(Arc::new(mmap))), checksum)
-                    } else if can_cache {
-                        let data = fs::read(&full_path).ok()?;
-                        memory_used.fetch_add(data.len(), Ordering::Relaxed);
-                        let checksum = xattr_checksum.unwrap_or_else(|| {
-                            let mut hasher = Sha256::new();
-                            hasher.update(&data);
-                            format!("{:x}", hasher.finalize())
-                        });
-                        (Some(FileContents::InMemory(data)), checksum)
-                    } else {
-                        let checksum = xattr_checksum.unwrap_or_else(|| {
-                            file_sha256(&full_path).unwrap_or_default()
-                        });
-                        (None, checksum)
-                    };
+                        let current_memory = memory_used.load(Ordering::Relaxed);
+                        // Use saturating_add to prevent overflow when checking cache capacity
+                        let can_cache = current_memory.saturating_add(file_size as usize) <= memory_limit;
 
-                    EntryKind::Regular { checksum, contents }
+                        let (contents, checksum) = if file_size >= MMAP_THRESHOLD {
+                            let file = fs::File::open(&full_path).ok()?;
+                            // SAFETY: The source filesystem is expected to be stable during OCI builds.
+                            // Files should not be modified or deleted while we hold the mmap.
+                            let mmap = unsafe { Mmap::map(&file).ok()? };
+                            let checksum = xattr_checksum.unwrap_or_else(|| {
+                                let mut hasher = Sha256::new();
+                                hasher.update(&mmap[..]);
+                                format!("{:x}", hasher.finalize())
+                            });
+                            (Some(FileContents::Mapped(Arc::new(mmap))), checksum)
+                        } else if can_cache {
+                            let data = fs::read(&full_path).ok()?;
+                            memory_used.fetch_add(data.len(), Ordering::Relaxed);
+                            let checksum = xattr_checksum.unwrap_or_else(|| {
+                                let mut hasher = Sha256::new();
+                                hasher.update(&data);
+                                format!("{:x}", hasher.finalize())
+                            });
+                            (Some(FileContents::InMemory(data)), checksum)
+                        } else {
+                            let checksum = xattr_checksum.unwrap_or_else(|| {
+                                file_sha256(&full_path).unwrap_or_default()
+                            });
+                            (None, checksum)
+                        };
+
+                        EntryKind::Regular { checksum, contents }
+                    }
                 }
             } else {
                 EntryKind::Other
@@ -417,8 +419,10 @@ fn precalculate_layer_data(upper: &Path, config: &GlobalConfig) -> LayerData {
     let mut children: FxHashMap<PathBuf, Vec<String>> = FxHashMap::default();
     for path in results.keys() {
         if let Some(parent) = path.parent() {
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            children.entry(parent.to_path_buf()).or_default().push(name);
+            if let Some(file_name) = path.file_name() {
+                let name = file_name.to_string_lossy().to_string();
+                children.entry(parent.to_path_buf()).or_default().push(name);
+            }
         }
     }
 
@@ -467,7 +471,12 @@ pub fn create_layer<W: std::io::Write>(
                 size: 0,
             }
         } else {
-            layer_data.entries.get(&root).unwrap().metadata.clone()
+            match layer_data.entries.get(&root) {
+                Some(entry) => entry.metadata.clone(),
+                None => {
+                    anyhow::bail!("Missing entry in layer data for path: {:?}", root);
+                }
+            }
         };
 
         dir_header.set_mode(metadata.mode);
@@ -500,9 +509,13 @@ pub fn create_layer<W: std::io::Write>(
         };
 
         if let Some(old_files) = lower_analysis.dir_contents.get(lookup_prefix.as_ref()) {
+            // Build HashSet for O(1) lookups instead of O(log n) binary_search
+            let child_set: std::collections::HashSet<&str> =
+                child_names.iter().map(|s| s.as_str()).collect();
+
             for old_file in old_files {
-                // Check if missing in current layer
-                if child_names.binary_search(old_file).is_err() {
+                // Check if missing in current layer - O(1) with HashSet
+                if !child_set.contains(old_file.as_str()) {
                     path_scratch.clear();
                     path_scratch.push_str(&rel_prefix);
                     path_scratch.push_str(old_file);
@@ -531,8 +544,13 @@ pub fn create_layer<W: std::io::Write>(
         // Process non-directory files
         for name in child_names {
             let path = root.join(name);
-            let info = layer_data.entries.get(&path).unwrap();
-            
+            let info = match layer_data.entries.get(&path) {
+                Some(entry) => entry,
+                None => {
+                    anyhow::bail!("Missing entry in layer data for file: {:?}", path);
+                }
+            };
+
             if let EntryKind::Directory = info.kind {
                 continue;
             }
@@ -549,7 +567,6 @@ pub fn create_layer<W: std::io::Write>(
             header.set_mtime(if let Some(ep) = epoch { ep } else { info.metadata.mtime as u64 });
 
             let mut pax_headers: HashMap<String, String> = HashMap::with_capacity(8);
-            let symlink_target_str; // For symlink dedup check
 
             match &info.kind {
                 EntryKind::Regular { checksum, .. } => {
@@ -560,33 +577,53 @@ pub fn create_layer<W: std::io::Write>(
                     }
                     pax_headers.insert(PAX_HEADER_SHA256.to_string(), checksum.clone());
                     
-                    // Deduplication check
+                    // Deduplication check - short-circuit on checksum first (most discriminating, O(1))
                     if let Some(lower_entry) = lower_analysis.files.get(rel.as_str()) {
-                         if lower_entry.entry_type == tar::EntryType::Regular.as_byte()
+                        // Check checksum FIRST - most selective, avoids allocations if mismatch
+                        let checksum_matches = lower_entry
+                            .pax_headers
+                            .get(PAX_HEADER_SHA256)
+                            .map(|other| checksum == other)
+                            .unwrap_or(false);
+
+                        if checksum_matches
+                            && lower_entry.entry_type == tar::EntryType::Regular.as_byte()
                             && lower_entry.size == info.metadata.size
                             && lower_entry.mode == info.metadata.mode
                             && lower_entry.uid == info.metadata.uid
                             && lower_entry.gid == info.metadata.gid
                             && lower_entry.mtime == (if let Some(ep) = epoch { ep } else { info.metadata.mtime as u64 })
                         {
-                             // Check xattrs/checksum
-                             let mut my_xattrs: Vec<(&String, &String)> = pax_headers.iter()
-                                .filter(|(k, _)| k.starts_with(PAX_HEADER_XATTR))
-                                .collect();
-                             my_xattrs.sort();
-                             
-                             let mut lower_xattrs: Vec<(&String, &String)> = lower_entry.pax_headers.iter()
-                                .filter(|(k, _)| k.starts_with(PAX_HEADER_XATTR))
-                                .collect();
-                             lower_xattrs.sort();
+                            // Short-circuit xattr comparison: count first to avoid allocation if counts differ
+                            let my_xattr_count = pax_headers
+                                .keys()
+                                .filter(|k| k.starts_with(PAX_HEADER_XATTR))
+                                .count();
+                            let lower_xattr_count = lower_entry
+                                .pax_headers
+                                .keys()
+                                .filter(|k| k.starts_with(PAX_HEADER_XATTR))
+                                .count();
 
-                             if my_xattrs == lower_xattrs {
-                                 if let Some(other_checksum) = lower_entry.pax_headers.get(PAX_HEADER_SHA256) {
-                                     if checksum == other_checksum {
-                                         continue; // Skip!
-                                     }
-                                 }
-                             }
+                            if my_xattr_count == lower_xattr_count {
+                                // Only allocate if counts match
+                                let mut my_xattrs: Vec<(&String, &String)> = pax_headers
+                                    .iter()
+                                    .filter(|(k, _)| k.starts_with(PAX_HEADER_XATTR))
+                                    .collect();
+                                my_xattrs.sort();
+
+                                let mut lower_xattrs: Vec<(&String, &String)> = lower_entry
+                                    .pax_headers
+                                    .iter()
+                                    .filter(|(k, _)| k.starts_with(PAX_HEADER_XATTR))
+                                    .collect();
+                                lower_xattrs.sort();
+
+                                if my_xattrs == lower_xattrs {
+                                    continue; // Skip! File is identical to lower layer
+                                }
+                            }
                         }
                     }
                 }
@@ -594,8 +631,8 @@ pub fn create_layer<W: std::io::Write>(
                     header.set_entry_type(tar::EntryType::Symlink);
                     header.set_size(0);
                     header.set_link_name(target)?;
-                    symlink_target_str = target.clone();
-                    
+
+                    // Deduplication check for symlinks
                     if let Some(lower_entry) = lower_analysis.files.get(rel.as_str()) {
                          if lower_entry.entry_type == tar::EntryType::Symlink.as_byte()
                             && lower_entry.mode == info.metadata.mode
@@ -603,7 +640,7 @@ pub fn create_layer<W: std::io::Write>(
                             && lower_entry.gid == info.metadata.gid
                         {
                             if let Some(lower_target) = &lower_entry.symlink_target {
-                                if &symlink_target_str == lower_target {
+                                if target == lower_target {
                                     continue;
                                 }
                             }
@@ -674,6 +711,7 @@ pub fn create_layer<W: std::io::Write>(
     Ok(())
 }
 
+#[inline]
 fn count_digits(n: usize) -> usize {
     if n == 0 {
         return 1;
@@ -687,6 +725,7 @@ fn count_digits(n: usize) -> usize {
     count
 }
 
+#[inline]
 fn pathdiff<'a>(path: &'a Path, base: &Path) -> Cow<'a, str> {
     match path.strip_prefix(base) {
         Ok(rel) => {

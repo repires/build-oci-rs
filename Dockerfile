@@ -27,13 +27,17 @@ COPY python-original/ /opt/python-oci/
 RUN cd /opt/python-oci && python3 setup.py install 2>/dev/null || \
     (cd /opt/python-oci && python3 -m pip install --break-system-packages . 2>/dev/null) || \
     (echo '#!/usr/bin/env python3' > /usr/local/bin/build-oci-py && \
-     echo 'import sys; sys.path.insert(0, "/opt/python-oci")' >> /usr/local/bin/build-oci-py && \
-     echo 'from oci_builder.cmd import main; main()' >> /usr/local/bin/build-oci-py && \
-     chmod +x /usr/local/bin/build-oci-py)
+    echo 'import sys; sys.path.insert(0, "/opt/python-oci")' >> /usr/local/bin/build-oci-py && \
+    echo 'from oci_builder.cmd import main; main()' >> /usr/local/bin/build-oci-py && \
+    chmod +x /usr/local/bin/build-oci-py)
 
 # Copy test script
 COPY test.sh /test.sh
 RUN chmod +x /test.sh
+
+# Copy benchmark script
+COPY benchmark.sh /benchmark.sh
+RUN chmod +x /benchmark.sh
 
 WORKDIR /workspace
 

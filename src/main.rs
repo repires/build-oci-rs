@@ -34,7 +34,7 @@ use std::io::Read;
 
 use anyhow::{bail, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Compression {
     Gzip,
     Zstd,

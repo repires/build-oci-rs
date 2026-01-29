@@ -23,6 +23,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, LazyLock};
 use rustc_hash::FxHashMap;
+use sha2::{Digest, Sha256};
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
@@ -31,11 +32,10 @@ use gzp::deflate::Gzip;
 use gzp::par::compress::ParCompress;
 use gzp::ZWriter;
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-use crate::util::{get_source_date_epoch, HashingWriter};
+use crate::util::{get_source_date_epoch, HashingWriter, SharedHashWriter};
 
 use crate::blob::{Blob, IO_BUF_SMALL, IO_BUF_MEDIUM};
 use crate::layer_builder::{analyze_lowers, create_layer};
@@ -48,24 +48,26 @@ type OciImageInfo = (Vec<serde_json::Value>, Vec<PathBuf>, Vec<String>, Vec<serd
 type ExtractCacheKey = (PathBuf, usize, Compression);
 
 /// Type alias to reduce clippy::type_complexity warning
-type ExtractCache = LazyLock<Mutex<FxHashMap<ExtractCacheKey, OciImageInfo>>>;
+/// Uses Arc<OciImageInfo> to share cached data without full clones
+type ExtractCache = LazyLock<Mutex<FxHashMap<ExtractCacheKey, Arc<OciImageInfo>>>>;
 type AnalysisCache = LazyLock<Mutex<FxHashMap<Vec<PathBuf>, Arc<crate::layer_builder::LowerAnalysis>>>>;
 
 static EXTRACT_CACHE: ExtractCache = LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 static ANALYSIS_CACHE: AnalysisCache = LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
-
-
 pub fn extract_oci_image_info(
     path: &Path,
     index: usize,
     global_conf: &GlobalConfig,
-) -> Result<OciImageInfo> {
-    let cache_key = (path.to_path_buf(), index, global_conf.compression.clone());
+) -> Result<Arc<OciImageInfo>> {
+    let cache_key = (path.to_path_buf(), index, global_conf.compression);
     {
-        if let Some(cached) = EXTRACT_CACHE.lock().unwrap().get(&cache_key) {
-            return Ok(cached.clone());
+        let cache = EXTRACT_CACHE
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Extract cache lock poisoned: {}", e))?;
+        if let Some(cached) = cache.get(&cache_key) {
+            return Ok(Arc::clone(cached)); // Cheap Arc clone instead of full data clone
         }
     }
 
@@ -74,24 +76,38 @@ pub fn extract_oci_image_info(
         serde_json::from_reader(fs::File::open(&index_path).context("Opening index.json")?)?;
 
     let image_desc = &index_data["manifests"][index];
-    let digest_str = image_desc["digest"].as_str().unwrap();
-    let (algo, digest) = digest_str.split_once(':').unwrap();
+    let digest_str = image_desc["digest"]
+        .as_str()
+        .context("Missing 'digest' in manifest descriptor")?;
+    let (algo, digest) = digest_str
+        .split_once(':')
+        .context("Invalid digest format: expected 'algorithm:hash'")?;
 
     let manifest_path = path.join("blobs").join(algo).join(digest);
     let image_manifest: serde_json::Value =
         serde_json::from_reader(fs::File::open(&manifest_path)?)?;
 
-    let config_digest_str = image_manifest["config"]["digest"].as_str().unwrap();
-    let (algo2, digest2) = config_digest_str.split_once(':').unwrap();
+    let config_digest_str = image_manifest["config"]["digest"]
+        .as_str()
+        .context("Missing 'config.digest' in image manifest")?;
+    let (algo2, digest2) = config_digest_str
+        .split_once(':')
+        .context("Invalid config digest format: expected 'algorithm:hash'")?;
     let config_path = path.join("blobs").join(algo2).join(digest2);
     let image_config: serde_json::Value = serde_json::from_reader(fs::File::open(&config_path)?)?;
 
-    let diff_ids: Vec<String> = image_config["rootfs"]["diff_ids"]
+    let diff_ids_array = image_config["rootfs"]["diff_ids"]
         .as_array()
-        .unwrap()
+        .context("Missing 'rootfs.diff_ids' array in image config")?;
+    let diff_ids: Vec<String> = diff_ids_array
         .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow::anyhow!("Invalid diff_id at index {}: expected string", i))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let history: Vec<serde_json::Value> = image_config
         .get("history")
@@ -102,22 +118,41 @@ pub fn extract_oci_image_info(
     let mut layer_descs = Vec::new();
     let mut layer_files = Vec::new();
 
-    let layers = image_manifest["layers"].as_array().unwrap();
+    let layers = image_manifest["layers"]
+        .as_array()
+        .context("Missing 'layers' array in image manifest")?;
+
+    // Validate that diff_ids and layers arrays have matching lengths
+    if diff_ids.len() != layers.len() {
+        anyhow::bail!(
+            "Malformed OCI image: diff_ids count ({}) does not match layers count ({})",
+            diff_ids.len(),
+            layers.len()
+        );
+    }
 
     let results: Result<Vec<_>> = layers
         .par_iter()
         .enumerate()
         .map(|(i, layer)| {
-    let layer_digest_str = layer["digest"].as_str().unwrap();
-            let (lalgo, ldigest) = layer_digest_str.split_once(':').unwrap();
+            let layer_digest_str = layer["digest"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'digest' in layer {}", i))?;
+            let (lalgo, ldigest) = layer_digest_str
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("Invalid layer digest format at index {}", i))?;
             let origfile = path.join("blobs").join(lalgo).join(ldigest);
 
-            let layer_media_type = layer["mediaType"].as_str().unwrap();
+            let layer_media_type = layer["mediaType"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'mediaType' in layer {}", i))?;
             let is_gzipped = layer_media_type.ends_with("+gzip");
             let is_zstd = layer_media_type.ends_with("+zstd");
 
-            // diff_ids are read-only, safe to access
-            let (_, _diff_id) = diff_ids[i].split_once(':').unwrap();
+            // diff_ids are read-only, safe to access (already bounds-checked above)
+            let (_, _diff_id) = diff_ids[i]
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("Invalid diff_id format at index {}", i))?;
 
             let out_media_type = match global_conf.compression {
                 Compression::Gzip => "application/vnd.oci.image.layer.v1.tar+gzip",
@@ -149,7 +184,7 @@ pub fn extract_oci_image_info(
                 //
                 // Reader -> Decompress -> Compress -> HashingWriter -> TempFile
 
-                let (mut hashing_writer, digest_state) = HashingWriter::new(tmp_file);
+                let mut hashing_writer = HashingWriter::new(tmp_file);
 
                 match global_conf.compression {
                     Compression::Gzip => {
@@ -192,16 +227,21 @@ pub fn extract_oci_image_info(
                         }
                     }
                 }
-                
+
                 // Return the computed digest so Blob can use it (avoid re-reading)
-                let (_, _) = hashing_writer.finish()?; // flush/consume
-                let digest = format!("{:x}", digest_state.lock().unwrap().clone().finalize());
+                let (_, digest) = hashing_writer.finish()?;
                 Ok(Some(digest))
             })?;
 
             Ok((
-                output_blob.descriptor.as_ref().unwrap().to_json(),
-                output_blob.filename.unwrap(),
+                output_blob
+                    .descriptor
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Missing descriptor after layer extraction"))?
+                    .to_json(),
+                output_blob
+                    .filename
+                    .ok_or_else(|| anyhow::anyhow!("Missing filename after layer extraction"))?,
             ))
         })
         .collect();
@@ -213,8 +253,11 @@ pub fn extract_oci_image_info(
         layer_files.push(file);
     }
 
-    let out = (layer_descs, layer_files, diff_ids, history);
-    EXTRACT_CACHE.lock().unwrap().insert(cache_key, out.clone());
+    let out = Arc::new((layer_descs, layer_files, diff_ids, history));
+    EXTRACT_CACHE
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Extract cache lock poisoned: {}", e))?
+        .insert(cache_key, Arc::clone(&out));
     Ok(out)
 }
 
@@ -230,7 +273,11 @@ pub fn build_layer(
 
     let lower_cache_key = lowers.to_vec();
     let lower_analysis = {
-        let cached = ANALYSIS_CACHE.lock().unwrap().get(&lower_cache_key).cloned();
+        let cached = ANALYSIS_CACHE
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Analysis cache lock poisoned: {}", e))?
+            .get(&lower_cache_key)
+            .cloned();
         if let Some(cached) = cached {
             cached
         } else {
@@ -246,7 +293,10 @@ pub fn build_layer(
                 lower_archives.push(tar::Archive::new(reader));
             }
             let analysis = Arc::new(analyze_lowers(&mut lower_archives)?);
-            ANALYSIS_CACHE.lock().unwrap().insert(lower_cache_key, analysis.clone());
+            ANALYSIS_CACHE
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Analysis cache lock poisoned: {}", e))?
+                .insert(lower_cache_key, analysis.clone());
             analysis
         }
     };
@@ -257,18 +307,20 @@ pub fn build_layer(
         Compression::Gzip => {
             let compressed_tmp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
             let level = global_conf.compression_level.unwrap_or(5);
-            
-            // Outer hasher for BLOB digest (compressed)
-            let (blob_hasher, blob_digest_state) = HashingWriter::new(BufWriter::new(compressed_tmp.reopen()?));
+
+            // OPTIMIZATION: Use SharedHashWriter to compute blob digest on the fly.
+            // ParCompress consumes the writer, so we share the hasher via Arc<Mutex>.
+            let blob_hasher = Arc::new(Mutex::new(Sha256::new()));
+            let shared_writer = SharedHashWriter::new(BufWriter::new(compressed_tmp.reopen()?), blob_hasher.clone());
 
             let parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
                     .num_threads(global_conf.compression_threads)
                     .map_err(|e| anyhow::anyhow!("gzp thread config: {}", e))?
                     .compression_level(gzp::Compression::new(level))
-                    .from_writer(blob_hasher);
+                    .from_writer(shared_writer);
 
-            // Stack: tar -> BufWriter -> HashingWriter(diff_id) -> gzp -> HashingWriter(blob) -> file
-            let (diff_hasher, diff_digest_state) = HashingWriter::new(parz);
+            // Stack: tar -> BufWriter -> HashingWriter(diff_id) -> gzp -> SharedHashWriter(blob) -> file
+            let diff_hasher = HashingWriter::new(parz);
             let mut tar_builder = tar::Builder::new(BufWriter::new(diff_hasher));
             tar_builder.follow_symlinks(false);
 
@@ -276,49 +328,53 @@ pub fn build_layer(
 
             let buf_writer = tar_builder.into_inner()?;
             let hashing_writer = buf_writer.into_inner().map_err(|e| anyhow::anyhow!("bufwriter: {}", e))?;
-            let (mut parz_writer, _) = hashing_writer.finish()?;
+            let (mut parz_writer, diff_digest) = hashing_writer.finish()?;
             parz_writer.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
-            
-            // blob_hasher was consumed by parz, but we have the digest state
-            // and the output file persists because we used reopen()
-            
-            let blob_digest = format!("{:x}", blob_digest_state.lock().unwrap().clone().finalize());
-            let diff_digest = format!("{:x}", diff_digest_state.lock().unwrap().clone().finalize());
+
+            // Retrieve blob digest from shared hasher (no re-reading needed)
+            let blob_digest = format!(
+                "{:x}",
+                blob_hasher
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("Blob hasher lock poisoned: {}", e))?
+                    .clone()
+                    .finalize()
+            );
 
             let mut blob = Blob::new(
                 global_conf,
                 Some("application/vnd.oci.image.layer.v1.tar+gzip"),
             );
-            
+
             let size = compressed_tmp.as_file().metadata()?.len();
             blob.create_from_temp_with_digest(compressed_tmp, size, &blob_digest)?;
 
-            new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
+            new_layer_descs.push(
+                blob.descriptor
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Missing blob descriptor after gzip layer creation"))?
+                    .to_json(),
+            );
 
             let new_diff_ids = vec![format!("sha256:{}", diff_digest)];
             Ok((new_layer_descs, new_diff_ids))
         }
         Compression::Zstd => {
-            // STREAMING: tar -> hash(diff_id) -> zstd(multithread) -> file
-            // Then hash blob during copy to final location
-            // 
-            // NOTE: For zstd/gzp here we are hashing the UNCOMPRESSED stream (diff_id).
-            // We unfortunately still need the COMPRESSED digest (blob digest).
-            //
-            // Optimization: Wrap the outer writer in another HashingWriter?
-            // HashingWriter(File) <- Zstd <- HashingWriter(DiffID) <- Tar
-            
+            // STREAMING: tar -> hash(diff_id) -> zstd(multithread) -> hash(blob) -> file
+            // Unlike ParCompress, ZstdEncoder's finish() returns the inner writer,
+            // so we can properly chain HashingWriters.
+
             let compressed_tmp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
             let level = global_conf.compression_level.unwrap_or(3) as i32;
 
             // Outer hasher for BLOB digest (compressed)
-            let (blob_hasher, blob_digest_state) = HashingWriter::new(BufWriter::new(compressed_tmp.reopen()?));
+            let blob_hasher = HashingWriter::new(BufWriter::new(compressed_tmp.reopen()?));
 
             let mut zstd_encoder = ZstdEncoder::new(blob_hasher, level)?;
             zstd_encoder.multithread(global_conf.compression_threads as u32)?;
 
             // Stack: tar -> BufWriter -> HashingWriter(diff_id) -> zstd -> HashingWriter(blob) -> file
-            let (diff_hasher, diff_digest_state) = HashingWriter::new(zstd_encoder);
+            let diff_hasher = HashingWriter::new(zstd_encoder);
             let mut tar_builder = tar::Builder::new(BufWriter::new(diff_hasher));
             tar_builder.follow_symlinks(false);
 
@@ -326,52 +382,48 @@ pub fn build_layer(
 
             let buf_writer_diff = tar_builder.into_inner()?;
             let hashing_writer = buf_writer_diff.into_inner().map_err(|e| anyhow::anyhow!("bufwriter: {}", e))?;
-            let (zstd_writer, _) = hashing_writer.finish()?;
+            let (zstd_writer, diff_digest) = hashing_writer.finish()?;
             let blob_hasher = zstd_writer.finish()?;
-            
-            let (mut buf_writer, _) = blob_hasher.finish()?;
+
+            let (mut buf_writer, blob_digest) = blob_hasher.finish()?;
             buf_writer.flush()?;
-            
-            let blob_digest = format!("{:x}", blob_digest_state.lock().unwrap().clone().finalize());
-            let diff_digest = format!("{:x}", diff_digest_state.lock().unwrap().clone().finalize());
 
             let mut blob = Blob::new(
                 global_conf,
                 Some("application/vnd.oci.image.layer.v1.tar+zstd"),
             );
-            
-            // Re-open temp file for sizing/moving
-            // Note: compressed_tmp handle was cloned via reopen() but we need the original NamedTempFile
-            // to persist it. The HashingWriter took ownership of the *reopened* file.
-            // We use the original `compressed_tmp` variable which is still valid?
-            // Wait, reopen() creates a new File handle. The NamedTempFile `compressed_tmp` is still valid.
-            
+
             let size = compressed_tmp.as_file().metadata()?.len();
             blob.create_from_temp_with_digest(compressed_tmp, size, &blob_digest)?;
 
-            new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
+            new_layer_descs.push(
+                blob.descriptor
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Missing blob descriptor after zstd layer creation"))?
+                    .to_json(),
+            );
 
             let new_diff_ids = vec![format!("sha256:{}", diff_digest)];
             Ok((new_layer_descs, new_diff_ids))
         }
         Compression::Disabled => {
-            // No compression: tar -> dual hash (diff_id + blob_id) -> file
+            // No compression: tar -> hash -> file
             // Since uncompressed, diff_id == blob_id, compute once
-            
+
             let tar_tmp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
 
             let tar_hexdigest = {
                 // Hash while writing - this IS the blob digest too (no compression)
-                let (hashing_writer, digest_state) = HashingWriter::new(BufWriter::new(tar_tmp.reopen()?));
+                let hashing_writer = HashingWriter::new(BufWriter::new(tar_tmp.reopen()?));
                 let mut tar_builder = tar::Builder::new(BufWriter::new(hashing_writer));
                 tar_builder.follow_symlinks(false);
 
                 create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
                 let buf_writer_tar = tar_builder.into_inner()?;
                 let hashing_writer = buf_writer_tar.into_inner().map_err(|e| anyhow::anyhow!("bufwriter: {}", e))?;
-                let (mut buf_writer_file, _) = hashing_writer.finish()?;
+                let (mut buf_writer_file, digest) = hashing_writer.finish()?;
                 buf_writer_file.flush()?;
-                format!("{:x}", digest_state.lock().unwrap().clone().finalize())
+                digest
             };
 
             let size = tar_tmp.as_file().metadata()?.len();
@@ -382,7 +434,12 @@ pub fn build_layer(
             );
             // Use pre-computed digest - avoids re-reading the file
             blob.create_from_temp_with_digest(tar_tmp, size, &tar_hexdigest)?;
-            new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
+            new_layer_descs.push(
+                blob.descriptor
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Missing blob descriptor after uncompressed layer creation"))?
+                    .to_json(),
+            );
 
             let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
             Ok((new_layer_descs, new_diff_ids))
@@ -403,7 +460,7 @@ pub fn build_image(
     let epoch = get_source_date_epoch();
     let created = if let Some(ep) = epoch {
         chrono::DateTime::from_timestamp(ep as i64, 0)
-            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("Invalid SOURCE_DATE_EPOCH timestamp: {}", ep))?
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string()
     } else {
@@ -425,14 +482,18 @@ pub fn build_image(
 
     // Handle parent image
     if let Some(parent) = image.get("parent") {
-        let parent_image = parent["image"].as_str().unwrap();
+        let parent_image = parent["image"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'image' in parent"))?;
         let parent_index = parent.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-        let (pld, plf, pdi, ph) =
+        let parent_info =
             extract_oci_image_info(Path::new(parent_image), parent_index, global_conf)?;
-        layer_descs = pld;
-        layer_files = plf;
-        diff_ids = pdi;
-        history = Some(ph);
+        // Clone out of Arc - necessary since we modify these later
+        let (pld, plf, pdi, ph) = parent_info.as_ref();
+        layer_descs = pld.clone();
+        layer_files = plf.clone();
+        diff_ids = pdi.clone();
+        history = Some(ph.clone());
     }
 
     // Build layer
@@ -481,7 +542,11 @@ pub fn build_image(
     let mut manifest = serde_json::json!({
         "schemaVersion": 2,
         "layers": layer_descs,
-        "config": config_blob.descriptor.as_ref().unwrap().to_json(),
+        "config": config_blob
+            .descriptor
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing config blob descriptor"))?
+            .to_json(),
     });
     if let Some(annotations) = image.get("annotations") {
         manifest["annotations"] = annotations.clone();
@@ -501,7 +566,11 @@ pub fn build_image(
         Ok(Some(format!("{:x}", hasher.finalize())))
     })?;
 
-    let mut desc = manifest_blob.descriptor.as_ref().unwrap().to_json();
+    let mut desc = manifest_blob
+        .descriptor
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Missing manifest blob descriptor"))?
+        .to_json();
 
     // Platform
     let mut platform = serde_json::json!({

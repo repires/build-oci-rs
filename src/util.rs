@@ -24,24 +24,27 @@ use sha2::{Digest, Sha256};
 
 /// A writer wrapper that computes SHA256 hash while writing.
 /// This eliminates a separate hashing pass over the data.
+///
+/// Uses an owned Sha256 hasher (no mutex) since each instance is used
+/// single-threaded. This avoids lock acquisition overhead on every write.
 pub struct HashingWriter<W: Write> {
     inner: W,
-    hasher: Arc<Mutex<Sha256>>,
+    hasher: Sha256,
 }
 
 impl<W: Write> HashingWriter<W> {
-    pub fn new(inner: W) -> (Self, Arc<Mutex<Sha256>>) {
-        let hasher = Arc::new(Mutex::new(Sha256::new()));
-        (HashingWriter {
+    pub fn new(inner: W) -> Self {
+        HashingWriter {
             inner,
-            hasher: hasher.clone(),
-        }, hasher)
+            hasher: Sha256::new(),
+        }
     }
 
-    /// For compatibility when we still own the writer
+    /// Consume the writer and return the inner writer along with the computed digest.
+    /// This consumes the hasher directly without cloning.
     pub fn finish(mut self) -> io::Result<(W, String)> {
         self.inner.flush()?;
-        let digest = format!("{:x}", self.hasher.lock().unwrap().clone().finalize());
+        let digest = format!("{:x}", self.hasher.finalize());
         Ok((self.inner, digest))
     }
 }
@@ -49,7 +52,37 @@ impl<W: Write> HashingWriter<W> {
 impl<W: Write> Write for HashingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
-        self.hasher.lock().unwrap().update(&buf[..n]);
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A writer that updates a shared SHA256 hasher.
+/// Used when the writer ownership is consumed by a third-party library (like gzp)
+/// but we still need the hash of the data written to it.
+pub struct SharedHashWriter<W: Write> {
+    inner: W,
+    hasher: Arc<Mutex<Sha256>>,
+}
+
+impl<W: Write> SharedHashWriter<W> {
+    pub fn new(inner: W, hasher: Arc<Mutex<Sha256>>) -> Self {
+        Self { inner, hasher }
+    }
+}
+
+impl<W: Write> Write for SharedHashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        // Handle poisoned mutex gracefully - in I/O context, convert to io::Error
+        self.hasher
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hasher mutex poisoned"))?
+            .update(&buf[..n]);
         Ok(n)
     }
 

@@ -44,11 +44,16 @@ use crate::{Compression, GlobalConfig};
 /// Result type for extract_oci_image_info to reduce type complexity
 type OciImageInfo = (Vec<serde_json::Value>, Vec<PathBuf>, Vec<String>, Vec<serde_json::Value>);
 
-static EXTRACT_CACHE: LazyLock<Mutex<FxHashMap<(PathBuf, usize, Compression), OciImageInfo>>> = 
-    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+/// Cache key for extracted OCI images
+type ExtractCacheKey = (PathBuf, usize, Compression);
 
-static ANALYSIS_CACHE: LazyLock<Mutex<FxHashMap<Vec<PathBuf>, Arc<crate::layer_builder::LowerAnalysis>>>> = 
-    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+/// Type alias to reduce clippy::type_complexity warning
+type ExtractCache = LazyLock<Mutex<FxHashMap<ExtractCacheKey, OciImageInfo>>>;
+type AnalysisCache = LazyLock<Mutex<FxHashMap<Vec<PathBuf>, Arc<crate::layer_builder::LowerAnalysis>>>>;
+
+static EXTRACT_CACHE: ExtractCache = LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+static ANALYSIS_CACHE: AnalysisCache = LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 
 

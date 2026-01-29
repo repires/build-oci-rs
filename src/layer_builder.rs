@@ -92,7 +92,6 @@ pub struct LowerEntry {
     pub mode: u32,
     pub mtime: u64,
     pub size: u64,
-    pub linkname: String,
     pub pax_headers: HashMap<String, String>,
     pub symlink_target: Option<String>,
 }
@@ -128,11 +127,6 @@ fn parse_archive<R: Read>(archive: &mut tar::Archive<R>) -> Result<ArchiveEntrie
         let mode = entry.header().mode()?;
         let mtime = entry.header().mtime()?;
         let size = entry.header().size()?;
-        let linkname = entry
-            .header()
-            .link_name()?
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
         let path_str = entry.path()?.to_string_lossy().to_string();
         let (dirname, basename) = split_path(&path_str);
 
@@ -158,9 +152,12 @@ fn parse_archive<R: Read>(archive: &mut tar::Archive<R>) -> Result<ArchiveEntrie
 
             // Cache symlink target to avoid re-reading later
             let symlink_target = if entry_type == tar::EntryType::Symlink.as_byte() {
-               Some(linkname.clone())
+                entry
+                    .header()
+                    .link_name()?
+                    .map(|p| p.to_string_lossy().to_string())
             } else {
-               None
+                None
             };
 
             let le = LowerEntry {
@@ -170,7 +167,6 @@ fn parse_archive<R: Read>(archive: &mut tar::Archive<R>) -> Result<ArchiveEntrie
                 mode,
                 mtime,
                 size,
-                linkname,
                 pax_headers,
                 symlink_target,
             };
@@ -267,7 +263,7 @@ const MMAP_THRESHOLD: u64 = 64 * 1024; // 64KB
 
 /// Cached file contents - either in-memory or memory-mapped
 #[derive(Clone, Debug)]
-enum FileContents {
+pub(crate) enum FileContents {
     InMemory(Vec<u8>),
     Mapped(Arc<Mmap>),
 }

@@ -21,6 +21,8 @@
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, LazyLock};
+use rustc_hash::FxHashMap;
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
@@ -33,54 +35,35 @@ use sha2::{Digest, Sha256};
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-/// A writer wrapper that computes SHA256 hash while writing.
-/// This eliminates a separate hashing pass over the data.
-struct HashingWriter<W: Write> {
-    inner: W,
-    hasher: Sha256,
-}
+use crate::util::{get_source_date_epoch, HashingWriter};
 
-impl<W: Write> HashingWriter<W> {
-    fn new(inner: W) -> Self {
-        HashingWriter {
-            inner,
-            hasher: Sha256::new(),
-        }
-    }
-
-    fn finish(self) -> (W, String) {
-        let digest = format!("{:x}", self.hasher.finalize());
-        (self.inner, digest)
-    }
-}
-
-impl<W: Write> Write for HashingWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-use crate::blob::Blob;
+use crate::blob::{Blob, IO_BUF_SMALL, IO_BUF_MEDIUM};
 use crate::layer_builder::{analyze_lowers, create_layer};
 use crate::{Compression, GlobalConfig};
 
-fn get_source_date_epoch() -> Option<u64> {
-    std::env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-}
+/// Result type for extract_oci_image_info to reduce type complexity
+type OciImageInfo = (Vec<serde_json::Value>, Vec<PathBuf>, Vec<String>, Vec<serde_json::Value>);
+
+static EXTRACT_CACHE: LazyLock<Mutex<FxHashMap<(PathBuf, usize, Compression), OciImageInfo>>> = 
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+static ANALYSIS_CACHE: LazyLock<Mutex<FxHashMap<Vec<PathBuf>, Arc<crate::layer_builder::LowerAnalysis>>>> = 
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+
 
 pub fn extract_oci_image_info(
     path: &Path,
     index: usize,
     global_conf: &GlobalConfig,
-) -> Result<(Vec<serde_json::Value>, Vec<PathBuf>, Vec<String>, Vec<serde_json::Value>)> {
+) -> Result<OciImageInfo> {
+    let cache_key = (path.to_path_buf(), index, global_conf.compression.clone());
+    {
+        if let Some(cached) = EXTRACT_CACHE.lock().unwrap().get(&cache_key) {
+            return Ok(cached.clone());
+        }
+    }
+
     let index_path = path.join("index.json");
     let index_data: serde_json::Value =
         serde_json::from_reader(fs::File::open(&index_path).context("Opening index.json")?)?;
@@ -120,7 +103,7 @@ pub fn extract_oci_image_info(
         .par_iter()
         .enumerate()
         .map(|(i, layer)| {
-            let layer_digest_str = layer["digest"].as_str().unwrap();
+    let layer_digest_str = layer["digest"].as_str().unwrap();
             let (lalgo, ldigest) = layer_digest_str.split_once(':').unwrap();
             let origfile = path.join("blobs").join(lalgo).join(ldigest);
 
@@ -141,7 +124,8 @@ pub fn extract_oci_image_info(
 
             output_blob.create(|tmp_file| {
                 let inp = fs::File::open(&origfile)?;
-                let reader = BufReader::new(inp);
+                // Increase buffer size for I/O performance
+                let reader = BufReader::with_capacity(IO_BUF_SMALL, inp);
 
                 // First, get an uncompressed reader if needed
                 let mut decompressed: Box<dyn Read> = if is_gzipped {
@@ -152,20 +136,29 @@ pub fn extract_oci_image_info(
                     Box::new(reader)
                 };
 
-                // Now compress to the target format
+                // Now compress to the target format AND compute digest on the fly
+                // This avoids reading the file back to hash it.
+                //
+                // We write the COMPRESSED stream to the temp file, but we need
+                // the digest of that compressed stream.
+                //
+                // Reader -> Decompress -> Compress -> HashingWriter -> TempFile
+
+                let (mut hashing_writer, digest_state) = HashingWriter::new(tmp_file);
+
                 match global_conf.compression {
                     Compression::Gzip => {
                         if is_gzipped {
-                            // gzip -> gzip: reopen and copy directly
+                            // gzip -> gzip: reopen and copy directly (optimized path)
                             let inp = fs::File::open(&origfile)?;
-                            let mut reader = BufReader::new(inp);
-                            io::copy(&mut reader, tmp_file)?;
+                            let mut reader = BufReader::with_capacity(IO_BUF_MEDIUM, inp);
+                            io::copy(&mut reader, &mut hashing_writer)?;
                         } else {
                             let level = flate2::Compression::new(
-                                global_conf.compression_level.unwrap_or(5) as u32,
+                                global_conf.compression_level.unwrap_or(5),
                             );
                             let mut encoder =
-                                GzEncoder::new(std::io::Write::by_ref(tmp_file), level);
+                                GzEncoder::new(&mut hashing_writer, level);
                             io::copy(&mut decompressed, &mut encoder)?;
                             encoder.finish()?;
                         }
@@ -174,21 +167,31 @@ pub fn extract_oci_image_info(
                         if is_zstd {
                             // zstd -> zstd: reopen and copy directly
                             let inp = fs::File::open(&origfile)?;
-                            let mut reader = BufReader::new(inp);
-                            io::copy(&mut reader, tmp_file)?;
+                            let mut reader = BufReader::with_capacity(IO_BUF_MEDIUM, inp);
+                            io::copy(&mut reader, &mut hashing_writer)?;
                         } else {
                             let level = global_conf.compression_level.unwrap_or(3) as i32;
-                            let mut encoder = ZstdEncoder::new(tmp_file, level)?;
-                            encoder.multithread(global_conf.workers as u32)?;
+                            let mut encoder = ZstdEncoder::new(&mut hashing_writer, level)?;
+                            encoder.multithread(global_conf.compression_threads as u32)?;
                             io::copy(&mut decompressed, &mut encoder)?;
                             encoder.finish()?;
                         }
                     }
                     Compression::Disabled => {
-                        io::copy(&mut decompressed, tmp_file)?;
+                        if !is_gzipped && !is_zstd {
+                            let inp = fs::File::open(&origfile)?;
+                            let mut reader = BufReader::with_capacity(IO_BUF_MEDIUM, inp);
+                            io::copy(&mut reader, &mut hashing_writer)?;
+                        } else {
+                            io::copy(&mut decompressed, &mut hashing_writer)?;
+                        }
                     }
                 }
-                Ok(())
+                
+                // Return the computed digest so Blob can use it (avoid re-reading)
+                let (_, _) = hashing_writer.finish()?; // flush/consume
+                let digest = format!("{:x}", digest_state.lock().unwrap().clone().finalize());
+                Ok(Some(digest))
             })?;
 
             Ok((
@@ -205,7 +208,9 @@ pub fn extract_oci_image_info(
         layer_files.push(file);
     }
 
-    Ok((layer_descs, layer_files, diff_ids, history))
+    let out = (layer_descs, layer_files, diff_ids, history);
+    EXTRACT_CACHE.lock().unwrap().insert(cache_key, out.clone());
+    Ok(out)
 }
 
 pub fn build_layer(
@@ -213,107 +218,155 @@ pub fn build_layer(
     lowers: &[PathBuf],
     global_conf: &GlobalConfig,
 ) -> Result<(Vec<serde_json::Value>, Vec<String>)> {
-    let tmp_dir = Path::new("/var/tmp");
-    fs::create_dir_all(tmp_dir).ok();
+    // Use a temp dir inside the output dir to ensure same-filesystem moves
+    let output_path = Path::new(&global_conf.output);
+    let tmp_dir = output_path.join(".tmp");
+    fs::create_dir_all(&tmp_dir).ok();
 
-    // Open lower tars for deduplication analysis
-    let mut lower_archives: Vec<tar::Archive<Box<dyn Read + Send>>> = Vec::new();
-    for lower_path in lowers {
-        let f = fs::File::open(lower_path)?;
-        let reader: Box<dyn Read + Send> = match global_conf.compression {
-            Compression::Gzip => Box::new(GzDecoder::new(BufReader::new(f))),
-            Compression::Zstd => Box::new(ZstdDecoder::new(BufReader::new(f))?),
-            Compression::Disabled => Box::new(BufReader::new(f)),
-        };
-        lower_archives.push(tar::Archive::new(reader));
-    }
-    let lower_analysis = analyze_lowers(&mut lower_archives)?;
+    let lower_cache_key = lowers.to_vec();
+    let lower_analysis = {
+        let cached = ANALYSIS_CACHE.lock().unwrap().get(&lower_cache_key).cloned();
+        if let Some(cached) = cached {
+            cached
+        } else {
+            // Open lower tars for deduplication analysis
+            let mut lower_archives: Vec<tar::Archive<Box<dyn Read + Send>>> = Vec::new();
+            for lower_path in lowers {
+                let f = fs::File::open(lower_path)?;
+                let reader: Box<dyn Read + Send> = match global_conf.compression {
+                    Compression::Gzip => Box::new(GzDecoder::new(BufReader::new(f))),
+                    Compression::Zstd => Box::new(ZstdDecoder::new(BufReader::new(f))?),
+                    Compression::Disabled => Box::new(BufReader::new(f)),
+                };
+                lower_archives.push(tar::Archive::new(reader));
+            }
+            let analysis = Arc::new(analyze_lowers(&mut lower_archives)?);
+            ANALYSIS_CACHE.lock().unwrap().insert(lower_cache_key, analysis.clone());
+            analysis
+        }
+    };
 
     let mut new_layer_descs = Vec::new();
 
     match global_conf.compression {
         Compression::Gzip => {
-            // STREAMING: tar -> hash(diff_id) -> gzip -> file
-            // Then hash blob during copy to final location
-            let compressed_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
-            let level = global_conf.compression_level.unwrap_or(5) as u32;
+            let compressed_tmp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
+            let level = global_conf.compression_level.unwrap_or(5);
+            
+            // Outer hasher for BLOB digest (compressed)
+            let (blob_hasher, blob_digest_state) = HashingWriter::new(BufWriter::new(compressed_tmp.reopen()?));
 
-            let tar_hexdigest = {
-                let parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
-                    .num_threads(global_conf.workers)
+            let parz: ParCompress<Gzip> = ParCompress::<Gzip>::builder()
+                    .num_threads(global_conf.compression_threads)
                     .map_err(|e| anyhow::anyhow!("gzp thread config: {}", e))?
                     .compression_level(gzp::Compression::new(level))
-                    .from_writer(BufWriter::new(compressed_tmp.reopen()?));
+                    .from_writer(blob_hasher);
 
-                // Stack: tar -> HashingWriter(diff_id) -> gzp -> file
-                let diff_hasher = HashingWriter::new(parz);
-                let mut tar_builder = tar::Builder::new(diff_hasher);
-                tar_builder.follow_symlinks(false);
+            // Stack: tar -> BufWriter -> HashingWriter(diff_id) -> gzp -> HashingWriter(blob) -> file
+            let (diff_hasher, diff_digest_state) = HashingWriter::new(parz);
+            let mut tar_builder = tar::Builder::new(BufWriter::new(diff_hasher));
+            tar_builder.follow_symlinks(false);
 
-                create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
+            create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
 
-                let (mut parz, diff_digest) = tar_builder.into_inner()?.finish();
-                parz.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
-                diff_digest
-            };
+            let buf_writer = tar_builder.into_inner()?;
+            let hashing_writer = buf_writer.into_inner().map_err(|e| anyhow::anyhow!("bufwriter: {}", e))?;
+            let (mut parz_writer, _) = hashing_writer.finish()?;
+            parz_writer.finish().map_err(|e| anyhow::anyhow!("parallel gzip: {}", e))?;
+            
+            // blob_hasher was consumed by parz, but we have the digest state
+            // and the output file persists because we used reopen()
+            
+            let blob_digest = format!("{:x}", blob_digest_state.lock().unwrap().clone().finalize());
+            let diff_digest = format!("{:x}", diff_digest_state.lock().unwrap().clone().finalize());
 
             let mut blob = Blob::new(
                 global_conf,
                 Some("application/vnd.oci.image.layer.v1.tar+gzip"),
             );
-            blob.create_from_path(compressed_tmp.path())?;
+            
+            let size = compressed_tmp.as_file().metadata()?.len();
+            blob.create_from_temp_with_digest(compressed_tmp, size, &blob_digest)?;
+
             new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
 
-            let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
-            return Ok((new_layer_descs, new_diff_ids));
+            let new_diff_ids = vec![format!("sha256:{}", diff_digest)];
+            Ok((new_layer_descs, new_diff_ids))
         }
         Compression::Zstd => {
             // STREAMING: tar -> hash(diff_id) -> zstd(multithread) -> file
             // Then hash blob during copy to final location
-            let compressed_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
+            // 
+            // NOTE: For zstd/gzp here we are hashing the UNCOMPRESSED stream (diff_id).
+            // We unfortunately still need the COMPRESSED digest (blob digest).
+            //
+            // Optimization: Wrap the outer writer in another HashingWriter?
+            // HashingWriter(File) <- Zstd <- HashingWriter(DiffID) <- Tar
+            
+            let compressed_tmp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
             let level = global_conf.compression_level.unwrap_or(3) as i32;
 
-            let tar_hexdigest = {
-                let mut zstd_encoder = ZstdEncoder::new(BufWriter::new(compressed_tmp.reopen()?), level)?;
-                zstd_encoder.multithread(global_conf.workers as u32)?;
+            // Outer hasher for BLOB digest (compressed)
+            let (blob_hasher, blob_digest_state) = HashingWriter::new(BufWriter::new(compressed_tmp.reopen()?));
 
-                // Stack: tar -> HashingWriter(diff_id) -> zstd -> file
-                let diff_hasher = HashingWriter::new(zstd_encoder);
-                let mut tar_builder = tar::Builder::new(diff_hasher);
-                tar_builder.follow_symlinks(false);
+            let mut zstd_encoder = ZstdEncoder::new(blob_hasher, level)?;
+            zstd_encoder.multithread(global_conf.compression_threads as u32)?;
 
-                create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
+            // Stack: tar -> BufWriter -> HashingWriter(diff_id) -> zstd -> HashingWriter(blob) -> file
+            let (diff_hasher, diff_digest_state) = HashingWriter::new(zstd_encoder);
+            let mut tar_builder = tar::Builder::new(BufWriter::new(diff_hasher));
+            tar_builder.follow_symlinks(false);
 
-                let (zstd_encoder, diff_digest) = tar_builder.into_inner()?.finish();
-                zstd_encoder.finish()?;
-                diff_digest
-            };
+            create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
+
+            let buf_writer_diff = tar_builder.into_inner()?;
+            let hashing_writer = buf_writer_diff.into_inner().map_err(|e| anyhow::anyhow!("bufwriter: {}", e))?;
+            let (zstd_writer, _) = hashing_writer.finish()?;
+            let blob_hasher = zstd_writer.finish()?;
+            
+            let (mut buf_writer, _) = blob_hasher.finish()?;
+            buf_writer.flush()?;
+            
+            let blob_digest = format!("{:x}", blob_digest_state.lock().unwrap().clone().finalize());
+            let diff_digest = format!("{:x}", diff_digest_state.lock().unwrap().clone().finalize());
 
             let mut blob = Blob::new(
                 global_conf,
                 Some("application/vnd.oci.image.layer.v1.tar+zstd"),
             );
-            blob.create_from_path(compressed_tmp.path())?;
+            
+            // Re-open temp file for sizing/moving
+            // Note: compressed_tmp handle was cloned via reopen() but we need the original NamedTempFile
+            // to persist it. The HashingWriter took ownership of the *reopened* file.
+            // We use the original `compressed_tmp` variable which is still valid?
+            // Wait, reopen() creates a new File handle. The NamedTempFile `compressed_tmp` is still valid.
+            
+            let size = compressed_tmp.as_file().metadata()?.len();
+            blob.create_from_temp_with_digest(compressed_tmp, size, &blob_digest)?;
+
             new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
 
-            let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
-            return Ok((new_layer_descs, new_diff_ids));
+            let new_diff_ids = vec![format!("sha256:{}", diff_digest)];
+            Ok((new_layer_descs, new_diff_ids))
         }
         Compression::Disabled => {
             // No compression: tar -> dual hash (diff_id + blob_id) -> file
             // Since uncompressed, diff_id == blob_id, compute once
-            let tar_tmp = tempfile::NamedTempFile::new_in(tmp_dir)?;
+            
+            let tar_tmp = tempfile::NamedTempFile::new_in(&tmp_dir)?;
 
             let tar_hexdigest = {
                 // Hash while writing - this IS the blob digest too (no compression)
-                let hashing_writer = HashingWriter::new(BufWriter::new(tar_tmp.reopen()?));
-                let mut tar_builder = tar::Builder::new(hashing_writer);
+                let (hashing_writer, digest_state) = HashingWriter::new(BufWriter::new(tar_tmp.reopen()?));
+                let mut tar_builder = tar::Builder::new(BufWriter::new(hashing_writer));
                 tar_builder.follow_symlinks(false);
 
                 create_layer(&mut tar_builder, upper, &lower_analysis, global_conf)?;
-                let (mut buf_writer, digest) = tar_builder.into_inner()?.finish();
-                buf_writer.flush()?;
-                digest
+                let buf_writer_tar = tar_builder.into_inner()?;
+                let hashing_writer = buf_writer_tar.into_inner().map_err(|e| anyhow::anyhow!("bufwriter: {}", e))?;
+                let (mut buf_writer_file, _) = hashing_writer.finish()?;
+                buf_writer_file.flush()?;
+                format!("{:x}", digest_state.lock().unwrap().clone().finalize())
             };
 
             let size = tar_tmp.as_file().metadata()?.len();
@@ -327,7 +380,7 @@ pub fn build_layer(
             new_layer_descs.push(blob.descriptor.as_ref().unwrap().to_json());
 
             let new_diff_ids = vec![format!("sha256:{}", tar_hexdigest)];
-            return Ok((new_layer_descs, new_diff_ids));
+            Ok((new_layer_descs, new_diff_ids))
         }
     }
 }
@@ -412,7 +465,11 @@ pub fn build_image(
     config_blob.create(|f| {
         let json_bytes = serde_json::to_vec(&config)?;
         f.write_all(&json_bytes)?;
-        Ok(())
+        
+        // Compute digest of small JSON config in-memory
+        let mut hasher = Sha256::new();
+        hasher.update(&json_bytes);
+        Ok(Some(format!("{:x}", hasher.finalize())))
     })?;
 
     // Write manifest blob
@@ -432,7 +489,11 @@ pub fn build_image(
     manifest_blob.create(|f| {
         let json_bytes = serde_json::to_vec(&manifest)?;
         f.write_all(&json_bytes)?;
-        Ok(())
+
+        // Compute digest of manifest in-memory
+        let mut hasher = Sha256::new();
+        hasher.update(&json_bytes);
+        Ok(Some(format!("{:x}", hasher.finalize())))
     })?;
 
     let mut desc = manifest_blob.descriptor.as_ref().unwrap().to_json();

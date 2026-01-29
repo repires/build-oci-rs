@@ -19,8 +19,8 @@
 // SOFTWARE.
 
 use std::fs;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -28,7 +28,11 @@ use tempfile::NamedTempFile;
 
 use crate::GlobalConfig;
 
-const IO_BUF_SIZE: usize = 1024 * 1024;
+/// Buffer sizes for I/O operations, tuned for modern SSD performance
+pub const IO_BUF_SMALL: usize = 64 * 1024;   // 64KB - for metadata/small files
+pub const IO_BUF_MEDIUM: usize = 128 * 1024; // 128KB - for streaming compression
+pub const IO_BUF_LARGE: usize = 256 * 1024;  // 256KB - for file hashing
+pub const IO_BUF_HUGE: usize = 1024 * 1024;  // 1MB - for blob copying
 
 #[derive(Debug, Clone)]
 pub struct BlobDescriptor {
@@ -76,38 +80,44 @@ impl Blob {
 
     pub fn create<F>(&mut self, writer_fn: F) -> Result<()>
     where
-        F: FnOnce(&mut NamedTempFile) -> Result<()>,
+        F: FnOnce(&mut NamedTempFile) -> Result<Option<String>>,
     {
-        let mut tmp = NamedTempFile::new_in(&self.output_dir)?;
+        // Create temp file in the target directory directly to allow atomic rename (persist)
+        // We can't predict the filename yet, so we trust NamedTempFile to pick a safe one.
+        // Note: NamedTempFile::new_in ensures the file is on the same filesystem.
+        let blob_dir = self.output_dir.join("blobs").join("sha256");
+        fs::create_dir_all(&blob_dir)?;
+        
+        // We write to a temp file in the FINAL directory.
+        // This avoids cross-filesystem link errors and allows simple renaming.
+        let mut tmp = NamedTempFile::new_in(&blob_dir)?;
         let tmp_path = tmp.path().to_path_buf();
 
         let result = (|| -> Result<()> {
-            writer_fn(&mut tmp)?;
+            let provided_digest = writer_fn(&mut tmp)?;
 
             // Get file size
-            let size = tmp.seek(SeekFrom::End(0))?;
-            tmp.seek(SeekFrom::Start(0))?;
+            let size = tmp.as_file().metadata()?.len();
 
-            let blob_dir = self.output_dir.join("blobs").join("sha256");
-            fs::create_dir_all(&blob_dir)?;
-
-            // Hash and copy in a single pass (eliminates one full read)
-            let dest_tmp = NamedTempFile::new_in(&blob_dir)?;
-            let mut hasher = Sha256::new();
-            {
-                let mut dest_writer = BufWriter::new(dest_tmp.reopen()?);
-                let mut buf = [0u8; IO_BUF_SIZE];
+            let hexdigest = if let Some(d) = provided_digest {
+                // Trust the provided digest (avoid re-reading)
+                d
+            } else {
+                // Fallback: Hash the file (requires reading it back)
+                // Since we are already in the target dir, we just read and hash, no copy needed.
+                tmp.seek(SeekFrom::Start(0))?;
+                let mut reader = BufReader::with_capacity(IO_BUF_HUGE, tmp.reopen()?);
+                let mut hasher = Sha256::new();
+                let mut buf = [0u8; IO_BUF_HUGE];
                 loop {
-                    let n = tmp.read(&mut buf)?;
+                    let n = reader.read(&mut buf)?;
                     if n == 0 {
                         break;
                     }
                     hasher.update(&buf[..n]);
-                    dest_writer.write_all(&buf[..n])?;
                 }
-                dest_writer.flush()?;
-            }
-            let hexdigest = format!("{:x}", hasher.finalize());
+                format!("{:x}", hasher.finalize())
+            };
 
             self.descriptor = Some(BlobDescriptor {
                 media_type: self.media_type.clone(),
@@ -119,57 +129,22 @@ impl Blob {
 
             let dest = blob_dir.join(&hexdigest);
             self.filename = Some(dest.clone());
-            dest_tmp.persist(&dest).map_err(|e| anyhow::anyhow!("persist blob: {}", e))?;
+            
+            // Atomic rename to final digest name
+            tmp.persist(&dest).map_err(|e| anyhow::anyhow!("persist blob: {}", e))?;
 
             Ok(())
         })();
 
         if result.is_err() {
+            // Attempt cleanup if persist failed (though tempfile usually handles this)
             let _ = fs::remove_file(&tmp_path);
         }
 
         result
     }
 
-    pub fn create_from_path(&mut self, source_path: &Path) -> Result<()> {
-        let blob_dir = self.output_dir.join("blobs").join("sha256");
-        fs::create_dir_all(&blob_dir)?;
 
-        let mut file = fs::File::open(source_path)?;
-        let size = file.metadata()?.len();
-
-        // Hash and copy in a single pass
-        let dest_tmp = NamedTempFile::new_in(&blob_dir)?;
-        let mut hasher = Sha256::new();
-        {
-            let mut dest_writer = BufWriter::new(dest_tmp.reopen()?);
-            let mut buf = [0u8; IO_BUF_SIZE];
-            loop {
-                let n = file.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                dest_writer.write_all(&buf[..n])?;
-            }
-            dest_writer.flush()?;
-        }
-        let hexdigest = format!("{:x}", hasher.finalize());
-
-        self.descriptor = Some(BlobDescriptor {
-            media_type: self.media_type.clone(),
-            size,
-            digest: format!("sha256:{}", hexdigest),
-            platform: None,
-            annotations: None,
-        });
-
-        let dest = blob_dir.join(&hexdigest);
-        self.filename = Some(dest.clone());
-        dest_tmp.persist(&dest).map_err(|e| anyhow::anyhow!("persist blob: {}", e))?;
-
-        Ok(())
-    }
 
     /// Create blob from a temp file with a pre-computed digest.
     /// This avoids re-reading the file to compute the hash (zero-copy move).

@@ -28,12 +28,13 @@ static GLOBAL: Jemalloc = Jemalloc;
 mod blob;
 mod image_builder;
 mod layer_builder;
+pub mod util;
 
 use std::io::Read;
 
 use anyhow::{bail, Result};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Compression {
     Gzip,
     Zstd,
@@ -46,6 +47,7 @@ pub struct GlobalConfig {
     pub compression_level: Option<u32>,
     pub output: String,
     pub workers: usize,
+    pub compression_threads: usize,
     pub skip_xattrs: bool,
     pub prefetch_limit_mb: usize,
 }
@@ -68,7 +70,7 @@ fn parse_workers_arg() -> Option<usize> {
 }
 
 fn main() -> Result<()> {
-    let workers = parse_workers_arg().unwrap_or_else(|| num_cpus());
+    let workers = parse_workers_arg().unwrap_or_else(num_cpus);
 
     // Configure rayon thread pool
     rayon::ThreadPoolBuilder::new()
@@ -97,12 +99,10 @@ fn main() -> Result<()> {
         .get("compression-level")
         .and_then(|v| v.as_u64())
         .map(|v| v as u32)
-        .or_else(|| {
-            match compression {
-                Compression::Gzip => Some(5),
-                Compression::Zstd => Some(3), // zstd level 3 is a good default (fast, decent ratio)
-                Compression::Disabled => None,
-            }
+        .or(match compression {
+            Compression::Gzip => Some(5),
+            Compression::Zstd => Some(1), // zstd level 1 for max speed
+            Compression::Disabled => None,
         });
 
     let output = std::env::current_dir()?
@@ -120,20 +120,32 @@ fn main() -> Result<()> {
         .map(|v| v as usize)
         .unwrap_or(512); // Default 512MB limit for prefetch cache
 
-    let global_conf = GlobalConfig {
-        compression,
-        compression_level,
-        output,
-        workers,
-        skip_xattrs,
-        prefetch_limit_mb,
-    };
-
     let images = data
         .get("images")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+
+    let num_images = if !images.is_empty() { images.len() } else { 1 };
+    
+    // Avoid thread oversubscription:
+    // If we build M images in parallel, and each uses N compression threads, we have M*N threads.
+    // We want M*N <= workers approximately.
+    let compression_threads = if num_images > 1 {
+        std::cmp::max(1, workers / num_images)
+    } else {
+        workers
+    };
+
+    let global_conf = GlobalConfig {
+        compression,
+        compression_level,
+        output,
+        workers,
+        compression_threads,
+        skip_xattrs,
+        prefetch_limit_mb,
+    };
 
     let annotations = data.get("annotations");
 

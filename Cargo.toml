@@ -14,7 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 sha2 = "0.10"
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 tar = "0.4"
 tempfile = "3"
 xattr = "1"
@@ -26,6 +26,7 @@ memmap2 = "0.9"
 crossbeam-channel = "0.5"
 jwalk = "0.8"
 rustc-hash = "2"
+smallvec = { version = "1", features = ["union", "write"] }
 zstd = { version = "0.13", features = ["zstdmt"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]

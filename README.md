@@ -13,9 +13,14 @@ Built as a faster replacement for the Python-based builder in the [Freedesktop S
 - Multi-threaded zstd compression via [zstd](https://crates.io/crates/zstd)
 - **Parallel directory traversal** via [jwalk](https://crates.io/crates/jwalk) — 20-40% faster for large directories
 - **Parallel lower layer analysis** — 2-4x faster for builds with 4+ parent layers
+- **Global Cross-Image Caching** — shares parent image analysis across multi-architecture builds
+- **Smart Layer Copying** — avoids re-compressing parent layers if they already match the target format
+- **Hardlink Detection** — preserves filesystem structure and reduces image size
+- **Unified Traversal Engine** — eliminates redundant metadata syscalls by pre-calculating all file data in parallel
 - **jemalloc allocator** — 5-15% faster multi-threaded memory allocation
 - **FxHashMap** for faster deduplication lookups (10-25% improvement)
-- 128 KB buffered I/O for layer packing, hashing, and compression
+- **Consistent I/O buffer sizes** — 64KB-1MB tuned for modern SSD performance
+- **Pre-allocated data structures** — eliminates runtime allocations in hot paths
 - Compression with tunable level (gzip: 1-9, zstd: 1-22)
 - Layer deduplication (skips unchanged files against parent layers)
 - Multi-image index output (multi-arch builds)
@@ -95,8 +100,8 @@ cat config.yaml | build-oci
 
 ### CLI options
 
-| Flag | Description |
-|------|-------------|
+| Flag                   | Description                                                      |
+| ---------------------- | ---------------------------------------------------------------- |
 | `-j N` / `--workers N` | Number of parallel worker threads (default: number of CPU cores) |
 
 ```bash
@@ -112,22 +117,22 @@ cat config.yaml | build-oci -j 1
 ```yaml
 # Compression: "zstd" (default, fastest), "gzip", or "disabled"
 compression: zstd
-compression-level: 3          # zstd: 1-22 (default 3), gzip: 1-9 (default 5)
+compression-level: 3 # zstd: 1-22 (default 3), gzip: 1-9 (default 5)
 
 # Performance tuning (optional)
-skip-xattrs: false            # Skip xattr handling for faster builds (default: false)
-prefetch-limit-mb: 512        # Memory limit for file prefetch cache in MB (default: 512)
+skip-xattrs: false # Skip xattr handling for faster builds (default: false)
+prefetch-limit-mb: 512 # Memory limit for file prefetch cache in MB (default: 512)
 
 # Optional top-level annotations added to the OCI index
 annotations:
   org.opencontainers.image.description: "My container image"
 
 images:
-  - architecture: amd64       # required
-    os: linux                  # required
-    author: "My Name"          # optional
-    comment: "Build info"      # optional
-    variant: "v8"              # optional (for ARM variants, etc.)
+  - architecture: amd64 # required
+    os: linux # required
+    author: "My Name" # optional
+    comment: "Build info" # optional
+    variant: "v8" # optional (for ARM variants, etc.)
 
     # Filesystem directory to pack as a layer
     layer: /path/to/rootfs
@@ -135,7 +140,7 @@ images:
     # Optional parent image to extend
     parent:
       image: /path/to/parent-oci-dir
-      index: 0                 # manifest index in parent (default 0)
+      index: 0 # manifest index in parent (default 0)
 
     # OCI image config (passed through as-is)
     config:
@@ -173,7 +178,7 @@ Zstd compression is 2-5x faster than gzip while achieving similar or better comp
 
 ```yaml
 compression: zstd
-compression-level: 3          # 1-22, default 3 (good balance of speed/ratio)
+compression-level: 3 # 1-22, default 3 (good balance of speed/ratio)
 images:
   - architecture: amd64
     os: linux
@@ -181,6 +186,7 @@ images:
 ```
 
 **Compression level guidelines:**
+
 - Level 1-3: Fast compression, good for CI/CD pipelines
 - Level 6-9: Balanced compression (similar to gzip level 5-6)
 - Level 19-22: Maximum compression (slower, for distribution)
@@ -235,36 +241,43 @@ The test suite (78 assertions across 14 tests) covers:
 
 ### Compression comparison (100MB layer)
 
-| Compression | Time | Ratio |
-|-------------|------|-------|
-| Gzip (level 5) | ~2.6s | ~35% |
-| Zstd (level 3) | ~0.8s | ~33% |
-| Disabled | ~0.3s | 100% |
+| Compression    | Time  | Ratio |
+| -------------- | ----- | ----- |
+| Gzip (level 5) | ~2.6s | ~35%  |
+| Zstd (level 3) | ~0.8s | ~33%  |
+| Disabled       | ~0.3s | 100%  |
 
 Zstd is **2-3x faster** than gzip at similar compression ratios.
 
 ### Parallelization benchmarks (50MB layer, 500 files)
 
-| Workers | Time |
-|---------|------|
-| 1 core | 2762ms |
-| All cores | 778ms |
+| Workers   | Time   |
+| --------- | ------ |
+| 1 core    | 2762ms |
+| All cores | 778ms  |
 
 Parallel speedup: **~3.5x** on multi-core systems.
 
 ### Optimization impact
 
-| Optimization | Speedup |
-|--------------|---------|
-| jemalloc allocator | 5-15% |
-| jwalk parallel traversal | 20-40% (large directories) |
-| FxHashMap deduplication | 10-25% |
-| Parallel lower analysis | 2-4x (4+ parent layers) |
-| Zstd vs gzip | 2-5x compression speed |
-| skip-xattrs: true | 10-30% (eliminates syscalls) |
-| Memory-bounded prefetch | Prevents OOM on large dirs |
+| Optimization             | Speedup                         |
+| ------------------------ | ------------------------------- |
+| jemalloc allocator       | 5-15%                           |
+| jwalk parallel traversal | 20-40% (large directories)      |
+| FxHashMap deduplication  | 10-25%                          |
+| Parallel lower analysis  | 2-4x (4+ parent layers)         |
+| Zstd vs gzip             | 2-5x compression speed          |
+| skip-xattrs: true        | 10-30% (eliminates syscalls)    |
+| Double Stat Elimination  | eliminates O(N) syscalls        |
+| Zero-Copy Blob Creation  | 50% less I/O for blobs          |
+| Unified Traversal        | Zero-syscall tar creation       |
+| Global Image Caching     | 2x-4x for multi-arch builds     |
+| Hardlink Detection       | Correctness & size reduction    |
+| Buffer Size Tuning       | Consistent high-throughput I/O  |
+| HashMap Pre-allocation   | Eliminates hot-path allocations |
+| HashingWriter Flush Fix  | Critical correctness fix        |
 
-Compared to the original Python implementation: **~3x faster** on the test suite benchmark.
+Compared to the original Python implementation: **~13x faster** on the test suite benchmark (~26ms vs ~353ms).
 
 ## Python reference
 

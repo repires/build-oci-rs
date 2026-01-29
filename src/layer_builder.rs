@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -82,7 +82,7 @@ pub struct LowerEntry {
 }
 
 pub struct LowerAnalysis {
-    pub files: BTreeMap<String, LowerEntry>,
+    pub files: FxHashMap<String, LowerEntry>,
     // Use SmallVec for directory contents as most dirs have few entries
     pub dir_contents: FxHashMap<String, SmallVec<[String; 4]>>,
 }
@@ -175,7 +175,7 @@ pub fn analyze_lowers<R: Read + Send>(lowers: &mut [tar::Archive<R>]) -> Result<
     let parsed = parsed?;
 
     // Merge results sequentially to maintain overlay semantics
-    let mut lower_files: BTreeMap<String, LowerEntry> = BTreeMap::new();
+    let mut lower_files: FxHashMap<String, LowerEntry> = FxHashMap::default();
 
     for archive_entries in parsed {
         // Apply opaque whiteouts from this layer using O(n) retain
@@ -212,6 +212,11 @@ pub fn analyze_lowers<R: Read + Send>(lowers: &mut [tar::Archive<R>]) -> Result<
             .entry(dirname.into_owned())
             .or_default()
             .push(basename.into_owned());
+    }
+
+    // Sort children for deterministic output (needed since FxHashMap key iteration is not sorted)
+    for child_list in dir_contents.values_mut() {
+        child_list.sort();
     }
 
     Ok(LowerAnalysis {
@@ -384,21 +389,30 @@ fn precalculate_layer_data(upper: &Path, config: &GlobalConfig) -> LayerData {
 
                         let current_memory = memory_used.load(Ordering::Relaxed);
                         // Use saturating_add to prevent overflow when checking cache capacity
-                        let can_cache = current_memory.saturating_add(file_size as usize) <= memory_limit;
+                        // Count file_size against memory limit for both MMAP and RAM cache to ensure we don't exceed OS limits
+                        let new_usage = current_memory.saturating_add(file_size as usize);
+                        let within_limit = new_usage <= memory_limit;
 
-                        let (contents, checksum) = if file_size >= MMAP_THRESHOLD {
+                        let (contents, checksum) = if file_size >= MMAP_THRESHOLD && within_limit {
                             let file = fs::File::open(&full_path).ok()?;
                             advise_sequential(&file); // Hint kernel for sequential access
                             // SAFETY: The source filesystem is expected to be stable during OCI builds.
-                            // Files should not be modified or deleted while we hold the mmap.
-                            let mmap = unsafe { Mmap::map(&file).ok()? };
-                            let checksum = xattr_checksum.unwrap_or_else(|| {
-                                let mut hasher = Sha256::new();
-                                hasher.update(&mmap[..]);
-                                format!("{:x}", hasher.finalize())
-                            });
-                            (Some(FileContents::Mapped(Arc::new(mmap))), checksum)
-                        } else if can_cache {
+                            if let Ok(mmap) = unsafe { Mmap::map(&file) } {
+                                memory_used.fetch_add(file_size as usize, Ordering::Relaxed);
+                                let checksum = xattr_checksum.unwrap_or_else(|| {
+                                    let mut hasher = Sha256::new();
+                                    hasher.update(&mmap[..]);
+                                    format!("{:x}", hasher.finalize())
+                                });
+                                (Some(FileContents::Mapped(Arc::new(mmap))), checksum)
+                            } else {
+                                // mmap failed, fallback to read-hash-discard
+                                let checksum = xattr_checksum.unwrap_or_else(|| {
+                                    file_sha256(&full_path).unwrap_or_default()
+                                });
+                                (None, checksum)
+                            }
+                        } else if within_limit {
                             // For small cached files, use read with fadvise
                             let file = fs::File::open(&full_path).ok()?;
                             advise_sequential(&file);
@@ -413,6 +427,7 @@ fn precalculate_layer_data(upper: &Path, config: &GlobalConfig) -> LayerData {
                             });
                             (Some(FileContents::InMemory(data)), checksum)
                         } else {
+                            // Fallback: Read-Hash-Discard (for large files when limit exceeded)
                             let checksum = xattr_checksum.unwrap_or_else(|| {
                                 file_sha256(&full_path).unwrap_or_default()
                             });

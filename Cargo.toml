@@ -29,9 +29,13 @@ rustc-hash = "2"
 smallvec = { version = "1", features = ["union", "write"] }
 dashmap = "6"
 zstd = { version = "0.13", features = ["zstdmt"] }
+lasso = { version = "0.7", features = ["multi-threaded"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

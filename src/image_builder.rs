@@ -35,7 +35,7 @@ use rayon::prelude::*;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-use crate::util::{get_source_date_epoch, HashingWriter, SharedHashWriter};
+use crate::util::{advise_sequential, get_source_date_epoch, HashingWriter, SharedHashWriter};
 
 use crate::blob::{Blob, IO_BUF_SMALL, IO_BUF_MEDIUM};
 use crate::layer_builder::{analyze_lowers, create_layer};
@@ -164,6 +164,7 @@ pub fn extract_oci_image_info(
 
             output_blob.create(|tmp_file| {
                 let inp = fs::File::open(&origfile)?;
+                advise_sequential(&inp); // Hint kernel for sequential layer reading
                 // Increase buffer size for I/O performance
                 let reader = BufReader::with_capacity(IO_BUF_SMALL, inp);
 
@@ -191,6 +192,7 @@ pub fn extract_oci_image_info(
                         if is_gzipped {
                             // gzip -> gzip: reopen and copy directly (optimized path)
                             let inp = fs::File::open(&origfile)?;
+                            advise_sequential(&inp);
                             let mut reader = BufReader::with_capacity(IO_BUF_MEDIUM, inp);
                             io::copy(&mut reader, &mut hashing_writer)?;
                         } else {
@@ -207,6 +209,7 @@ pub fn extract_oci_image_info(
                         if is_zstd {
                             // zstd -> zstd: reopen and copy directly
                             let inp = fs::File::open(&origfile)?;
+                            advise_sequential(&inp);
                             let mut reader = BufReader::with_capacity(IO_BUF_MEDIUM, inp);
                             io::copy(&mut reader, &mut hashing_writer)?;
                         } else {
@@ -220,6 +223,7 @@ pub fn extract_oci_image_info(
                     Compression::Disabled => {
                         if !is_gzipped && !is_zstd {
                             let inp = fs::File::open(&origfile)?;
+                            advise_sequential(&inp);
                             let mut reader = BufReader::with_capacity(IO_BUF_MEDIUM, inp);
                             io::copy(&mut reader, &mut hashing_writer)?;
                         } else {
@@ -285,6 +289,7 @@ pub fn build_layer(
             let mut lower_archives: Vec<tar::Archive<Box<dyn Read + Send>>> = Vec::new();
             for lower_path in lowers {
                 let f = fs::File::open(lower_path)?;
+                advise_sequential(&f); // Hint kernel for sequential tar reading
                 let reader: Box<dyn Read + Send> = match global_conf.compression {
                     Compression::Gzip => Box::new(GzDecoder::new(BufReader::new(f))),
                     Compression::Zstd => Box::new(ZstdDecoder::new(BufReader::new(f))?),

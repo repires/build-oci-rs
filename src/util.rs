@@ -18,9 +18,26 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+use std::fs::File;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
+
+/// Hint to the kernel for sequential file access (Linux optimization).
+/// This tells the kernel to aggressively prefetch file contents.
+#[cfg(target_os = "linux")]
+pub fn advise_sequential(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    // POSIX_FADV_SEQUENTIAL = 2 - enables aggressive readahead
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn advise_sequential(_file: &File) {
+    // No-op on non-Linux platforms
+}
 
 /// A writer wrapper that computes SHA256 hash while writing.
 /// This eliminates a separate hashing pass over the data.

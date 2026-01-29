@@ -21,29 +21,37 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
 use jwalk::WalkDir;
+use lasso::ThreadedRodeo;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
-use std::io::Write; // Import Write trait
 use smallvec::SmallVec;
 
 use crate::blob::IO_BUF_LARGE;
+use crate::util::advise_sequential;
 use crate::GlobalConfig;
+
+/// Global thread-safe string interner for path deduplication.
+/// Paths like "usr/share/doc/package/..." share common prefixes that are interned once.
+/// Available for future use when data structures can store Spur keys directly.
+#[allow(dead_code)]
+static PATH_INTERNER: LazyLock<ThreadedRodeo> = LazyLock::new(ThreadedRodeo::default);
 
 pub const PAX_HEADER_SHA256: &str = "freedesktopsdk.checksum.sha256";
 pub const PAX_HEADER_XATTR: &str = "SCHILY.xattr.";
 
 fn file_sha256(path: &Path) -> Result<String> {
     let file = fs::File::open(path)?;
+    advise_sequential(&file); // Hint kernel for sequential read
     let mut reader = BufReader::with_capacity(IO_BUF_LARGE, file);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; IO_BUF_LARGE];
@@ -380,6 +388,7 @@ fn precalculate_layer_data(upper: &Path, config: &GlobalConfig) -> LayerData {
 
                         let (contents, checksum) = if file_size >= MMAP_THRESHOLD {
                             let file = fs::File::open(&full_path).ok()?;
+                            advise_sequential(&file); // Hint kernel for sequential access
                             // SAFETY: The source filesystem is expected to be stable during OCI builds.
                             // Files should not be modified or deleted while we hold the mmap.
                             let mmap = unsafe { Mmap::map(&file).ok()? };
@@ -390,7 +399,12 @@ fn precalculate_layer_data(upper: &Path, config: &GlobalConfig) -> LayerData {
                             });
                             (Some(FileContents::Mapped(Arc::new(mmap))), checksum)
                         } else if can_cache {
-                            let data = fs::read(&full_path).ok()?;
+                            // For small cached files, use read with fadvise
+                            let file = fs::File::open(&full_path).ok()?;
+                            advise_sequential(&file);
+                            let mut data = Vec::with_capacity(file_size as usize);
+                            let mut reader = BufReader::new(file);
+                            reader.read_to_end(&mut data).ok()?;
                             memory_used.fetch_add(data.len(), Ordering::Relaxed);
                             let checksum = xattr_checksum.unwrap_or_else(|| {
                                 let mut hasher = Sha256::new();
